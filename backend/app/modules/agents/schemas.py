@@ -78,6 +78,9 @@ class AgentConfig(BaseModel):
     memory: AgentMemoryConfig = Field(default_factory=AgentMemoryConfig)
     escalation: EscalationRules = Field(default_factory=EscalationRules)
 
+    expected_terminal_tool: str | None = None
+    require_verified_terminal: bool = True
+
     @field_validator("instructions")
     @classmethod
     def _instructions_stripped(cls, v: str) -> str:

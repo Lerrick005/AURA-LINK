@@ -167,6 +167,35 @@ def compute_idempotency_key(
     return "ek_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
+# --- Step decision (runtime engine's pure decision output) -------------
+
+TerminalToolStatus = Literal[
+    "not_run",
+    "ran_ok_verified",
+    "ran_ok_unverified",
+    "ran_failed",
+]
+
+
+StepKind = Literal[
+    "reasoning",
+    "policy_check",
+    "tool_call",
+    "verifying",
+    "terminate",
+]
+
+
+@dataclass(frozen=True)
+class StepDecision:
+    """Pure output of decide_next_step. No I/O; the loop dispatches on kind."""
+    kind: StepKind
+    proposals: tuple[ToolCall, ...] = ()
+    proposal_index: int = 0
+    terminal_reason: TerminalReason | None = None
+    post_nudge: bool = False
+
+
 __all__ = [
     "ToolResult",
     "ToolExecutor",
@@ -181,6 +210,9 @@ __all__ = [
     "IndeterminateSideEffectError",
     "RepeatedRejectionError",
     "TerminalReason",
+    "TerminalToolStatus",
+    "StepKind",
+    "StepDecision",
     "EngineConfig",
     "compute_lease_ttl",
     "compute_idempotency_key",
