@@ -25,3 +25,5 @@ Thumbs.db
 # Local data
 *.sqlite3
 *.log
+backend/_patch_backup_*/
+_patch_backup_*/

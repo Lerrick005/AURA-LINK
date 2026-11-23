@@ -1,4 +1,4 @@
-"""The single chokepoint for redacting customer data before persistence.
+﻿"""The single chokepoint for redacting customer data before persistence.
 
 Doctrine (see SECURITY.md):
     Everything the runtime persists -- tool inputs, tool outputs, errors,
@@ -21,6 +21,7 @@ from typing import Any
 
 _ALLOWLIST_KEYS: frozenset[str] = frozenset(
     {
+        # Pre-existing entries
         "message_id",
         "delivery_status",
         "escalation_id",
@@ -34,6 +35,22 @@ _ALLOWLIST_KEYS: frozenset[str] = frozenset(
         "verified",
         "id",
         "kind",
+        # Audit fields the runtime engine writes to execution_steps.input,
+        # escalations.context, and tool_calls.error. These are internal enum
+        # strings, tool identifiers, and reason codes -- never PII or
+        # credentials. They must be readable by a human reviewer resolving an
+        # escalation. See SECURITY.md and §4.1-G / §4.1-I of the blueprint.
+        "reason",
+        "tool",
+        "last_step_type",
+        "terminal_tool_status",
+        "idempotency_mode",
+        "approval_policy",
+        "step_type",
+        "expected",
+        "satisfied",
+        "limit",
+        "from",
     }
 )
 

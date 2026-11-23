@@ -1,4 +1,4 @@
-"""Runtime engine types: protocols, exceptions, config.
+﻿"""Runtime engine types: protocols, exceptions, config.
 
 No logic here. This file defines the seams the engine plugs into and the
 errors it can raise, so that engine.py stays focused on the state machine
@@ -194,6 +194,7 @@ class StepDecision:
     proposal_index: int = 0
     terminal_reason: TerminalReason | None = None
     post_nudge: bool = False
+    escalation_reason: str | None = None
 
 
 __all__ = [

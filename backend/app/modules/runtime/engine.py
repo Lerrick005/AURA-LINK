@@ -1,4 +1,4 @@
-"""Runtime engine: state machine for governed agent execution.
+﻿"""Runtime engine: state machine for governed agent execution.
 
 Part A: infrastructure. Part B (next file section) adds run_once() and the
 step handlers. This file owns transaction boundaries, lease fencing, and
@@ -27,6 +27,9 @@ from app.adapters.llm.base import LLMProvider
 from app.core.db import tenant_session
 from app.core.ids import uuid7str
 from app.core.logging import get_logger
+from app.modules.runtime.types import TerminalToolStatus
+from app.modules.runtime.decision import RunState, decide_next_step
+from dataclasses import dataclass
 from app.core.redaction import redact
 from app.modules.agents.schemas import AgentConfig, ResolvedTool
 from app.modules.runtime.types import (
@@ -471,5 +474,1011 @@ class RuntimeEngine:
         )
         return call_id
 
+    # --- State loader ----------------------------------------------------
+
+    async def _load_state(
+        self, *, run_id: str, org_id: str
+    ) -> _LoadedState:
+        """Build the frozen RunState for decide_next_step.
+
+        Single short read; no long-held transactions. Returns the last 10
+        steps (enough to see the current cycle), counters, run_context
+        fields, agent config, and the tri-state terminal-tool status.
+        """
+        async with tenant_session(org_id) as s:
+            run_row = (
+                await s.execute(
+                    text(
+                        "SELECT agent_version_id, iteration_count, tool_call_count, "
+                        "       cost_usd, started_at, status "
+                        "FROM agent_runs WHERE id = :i"
+                    ),
+                    {"i": run_id},
+                )
+            ).mappings().first()
+            if run_row is None:
+                raise RunNotFound(run_id)
+
+            version_row = (
+                await s.execute(
+                    text(
+                        "SELECT version, config FROM agent_versions WHERE id = :v"
+                    ),
+                    {"v": run_row["agent_version_id"]},
+                )
+            ).mappings().first()
+            if version_row is None:
+                raise EngineError(
+                    "agent_version missing for run " + run_id
+                )
+
+            config = AgentConfig.model_validate(version_row["config"])
+
+            steps_rows = (
+                await s.execute(
+                    text(
+                        "SELECT seq, type, status FROM execution_steps "
+                        "WHERE execution_id = :e ORDER BY seq DESC LIMIT 10"
+                    ),
+                    {"e": run_id},
+                )
+            ).mappings().all()
+            steps = tuple(reversed(steps_rows))
+
+            ctx_row = (
+                await s.execute(
+                    text(
+                        "SELECT consecutive_rejections, scratch "
+                        "FROM run_context WHERE execution_id = :e"
+                    ),
+                    {"e": run_id},
+                )
+            ).mappings().first()
+            ctx_consecutive_rejections = (
+                int(ctx_row["consecutive_rejections"]) if ctx_row else 0
+            )
+            scratch = (ctx_row["scratch"] if ctx_row else {}) or {}
+            nudge_issued = bool(scratch.get("expected_terminal_nudge_issued", False))
+
+            # Pending proposal count: proposals in the most recent
+            # llm_response that have not yet been turned into tool_proposed
+            # or tool_rejected steps.
+            pending_proposals = 0
+            last_step_type: str | None = None
+            if steps:
+                last_step_type = str(steps[-1]["type"])
+            # Find most recent llm_response and count proposals made
+            # (proposals are in the llm_response step's output.tool_call_count,
+            #  if present) minus decisions already recorded after it.
+            for row in reversed(steps):
+                if row["type"] == "llm_response":
+                    output = (await s.execute(
+                        text(
+                            "SELECT output FROM execution_steps WHERE execution_id = :e AND seq = :sq"
+                        ),
+                        {"e": run_id, "sq": int(row["seq"])},
+                    )).scalar_one()
+                    proposed = int((output or {}).get("tool_call_count", 0))
+                    decided = sum(
+                        1 for r in steps
+                        if int(r["seq"]) > int(row["seq"])
+                        and r["type"] in ("tool_proposed", "tool_rejected")
+                    )
+                    pending_proposals = max(0, proposed - decided)
+                    break
+
+            terminal_status = await self._terminal_tool_status(
+                s=s, run_id=run_id, expected_key=config.expected_terminal_tool
+            )
+
+        elapsed = (_now() - run_row["started_at"]).total_seconds()
+        return _LoadedState(
+            steps=steps,
+            counters={
+                "iteration_count": int(run_row["iteration_count"]),
+                "tool_call_count": int(run_row["tool_call_count"]),
+                "cost_usd": float(run_row["cost_usd"]),
+                "elapsed_seconds": elapsed,
+            },
+            consecutive_rejections=ctx_consecutive_rejections,
+            nudge_issued=nudge_issued,
+            config=config,
+            terminal_tool_status=terminal_status,
+            pending_proposal_count=pending_proposals,
+            last_step_type=last_step_type,
+            agent_version_id=str(run_row["agent_version_id"]),
+            version=int(version_row["version"]),
+            status=str(run_row["status"]),
+        )
+
+    async def _terminal_tool_status(
+        self,
+        *,
+        s: AsyncSession,
+        run_id: str,
+        expected_key: str | None,
+    ) -> TerminalToolStatus:
+        """Tri-state check on the expected_terminal_tool for this run."""
+        if expected_key is None:
+            return "not_run"
+        row = (
+            await s.execute(
+                text(
+                    "SELECT status, verified FROM tool_calls "
+                    "WHERE execution_id = :e AND tool_key_snapshot = :k "
+                    "ORDER BY started_at DESC LIMIT 1"
+                ),
+                {"e": run_id, "k": expected_key},
+            )
+        ).mappings().first()
+        if row is None:
+            return "not_run"
+        status = str(row["status"])
+        verified = row["verified"]
+        if status in ("failed", "rejected", "stuck"):
+            return "ran_failed"
+        if status in ("executing",):
+            # Mid-flight: for verification purposes, treat as failed unless
+            # the resume pre-check already intervened (which would have
+            # escalated earlier).
+            return "ran_failed"
+        if status == "completed":
+            return "ran_ok_verified" if verified is True else "ran_ok_unverified"
+        return "not_run"
+
+    # --- Heartbeat -------------------------------------------------------
+
+    @asynccontextmanager
+    async def _heartbeat_cancels_loop(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        main_task: "asyncio.Task[TerminalReason]",
+    ) -> AsyncIterator[None]:
+        """Refreshes the lease. On fence loss, cancels the loop task."""
+        stop = asyncio.Event()
+
+        async def loop() -> None:
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(
+                        stop.wait(),
+                        timeout=self._config.heartbeat_interval_seconds,
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    async with tenant_session(org_id) as s:
+                        await self._fence_and_heartbeat(
+                            s=s, run_id=run_id, epoch=epoch
+                        )
+                except StaleLeaseError:
+                    log.warning(
+                        "heartbeat_lease_lost_cancelling_loop",
+                        extra={"run_id": run_id, "epoch": epoch},
+                    )
+                    main_task.cancel()
+                    return
+
+        task = asyncio.create_task(loop())
+        try:
+            yield
+        finally:
+            stop.set()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    # --- Public entry point ---------------------------------------------
+
+    async def run_once(self, *, run_id: str, org_id: str) -> TerminalReason:
+        """Drive the run to a terminal state. Idempotent per state rules."""
+        import uuid as _uuid
+        holder = "worker-" + _uuid.uuid4().hex[:8]
+        epoch = await self._claim_lease(run_id=run_id, org_id=org_id, holder=holder)
+
+        # Load agent_version_id early for the resume pre-check
+        state0 = await self._load_state(run_id=run_id, org_id=org_id)
+        agent_version_id = state0.agent_version_id
+
+        # Resume pre-check runs before the loop.
+        try:
+            await self._resume_pre_check(
+                run_id=run_id, org_id=org_id, agent_version_id=agent_version_id
+            )
+        except IndeterminateSideEffectError:
+            # _resume_pre_check already wrote escalation and terminal.
+            # Release lease and re-raise so caller sees the outcome.
+            await self._release_lease(run_id=run_id, org_id=org_id, epoch=epoch)
+            raise
+
+        loop_task: "asyncio.Task[TerminalReason]" = asyncio.create_task(
+            self._loop(run_id=run_id, org_id=org_id, epoch=epoch)
+        )
+        stale = False
+        try:
+            async with self._heartbeat_cancels_loop(
+                run_id=run_id, org_id=org_id, epoch=epoch, main_task=loop_task
+            ):
+                return await loop_task
+        except asyncio.CancelledError:
+            log.info(
+                "run_cancelled_by_heartbeat",
+                extra={"run_id": run_id, "epoch": epoch},
+            )
+            raise
+        except StaleLeaseError:
+            stale = True
+            log.warning(
+                "run_aborted_stale_lease",
+                extra={"run_id": run_id, "epoch": epoch},
+            )
+            raise
+        finally:
+            # Release the lease ONLY if we still own this epoch and the run
+            # is not in the stale/cancelled path. _release_lease is already
+            # epoch-fenced, so a stale caller is a no-op; explicit stale flag
+            # documents the intent and avoids any redundant UPDATE.
+            if not stale and not loop_task.cancelled():
+                with suppress(Exception):
+                    await self._release_lease(
+                        run_id=run_id, org_id=org_id, epoch=epoch
+                    )
+
+    # --- The loop --------------------------------------------------------
+
+    async def _loop(
+        self, *, run_id: str, org_id: str, epoch: int
+    ) -> TerminalReason:
+        while True:
+            state = await self._load_state(run_id=run_id, org_id=org_id)
+            run_state = RunState(
+                steps=state.steps,
+                iteration_count=state.counters["iteration_count"],
+                tool_call_count=state.counters["tool_call_count"],
+                cost_usd=state.counters["cost_usd"],
+                elapsed_seconds=state.counters["elapsed_seconds"],
+                consecutive_rejections=state.consecutive_rejections,
+                nudge_issued=state.nudge_issued,
+                config=state.config,
+                terminal_tool_status=state.terminal_tool_status,
+                pending_proposal_count=state.pending_proposal_count,
+                last_step_type=state.last_step_type,
+            )
+            decision = decide_next_step(run_state)
+
+            if decision.kind == "terminate":
+                reason = decision.terminal_reason
+                if reason is None:
+                    raise EngineError("terminate without terminal_reason")
+                async with tenant_session(org_id) as s:
+                    await self._fence_and_heartbeat(
+                        s=s, run_id=run_id, epoch=epoch
+                    )
+                    detail: dict[str, Any] = {"from": "decide_next_step"}
+                    if reason == "escalated":
+                        esc_reason = decision.escalation_reason or "policy_terminate"
+                        esc_id = await self._write_escalation(
+                            s=s,
+                            org_id=org_id,
+                            run_id=run_id,
+                            agent_version_id=state.agent_version_id,
+                            reason=esc_reason,
+                            context={
+                                "consecutive_rejections": state.consecutive_rejections,
+                                "last_step_type": state.last_step_type,
+                                "terminal_tool_status": state.terminal_tool_status,
+                                "nudge_issued": state.nudge_issued,
+                            },
+                        )
+                        detail["escalation_id"] = esc_id
+                        detail["escalation_reason"] = esc_reason
+                    await self._write_terminated(
+                        s=s,
+                        org_id=org_id,
+                        run_id=run_id,
+                        agent_version_id=state.agent_version_id,
+                        reason=reason,
+                        detail=detail,
+                    )
+                return reason
+
+            if decision.kind == "reasoning":
+                await self._step_reasoning(
+                    run_id=run_id,
+                    org_id=org_id,
+                    epoch=epoch,
+                    agent_version_id=state.agent_version_id,
+                    config=state.config,
+                    nudge=(
+                        state.config.expected_terminal_tool is not None
+                        and not state.nudge_issued
+                        and state.terminal_tool_status == "not_run"
+                        and state.last_step_type == "llm_response"
+                        and state.pending_proposal_count == 0
+                    ),
+                )
+                continue
+
+            if decision.kind == "policy_check":
+                await self._step_policy_check(
+                    run_id=run_id,
+                    org_id=org_id,
+                    epoch=epoch,
+                    agent_version_id=state.agent_version_id,
+                    config=state.config,
+                )
+                continue
+
+            if decision.kind == "tool_call":
+                await self._step_tool_call(
+                    run_id=run_id,
+                    org_id=org_id,
+                    epoch=epoch,
+                    agent_version_id=state.agent_version_id,
+                    config=state.config,
+                )
+                continue
+
+            if decision.kind == "verifying":
+                reason = await self._step_verifying(
+                    run_id=run_id,
+                    org_id=org_id,
+                    epoch=epoch,
+                    agent_version_id=state.agent_version_id,
+                    config=state.config,
+                    nudge=decision.post_nudge,
+                )
+                if reason is not None:
+                    return reason
+                continue
+
+            raise EngineError("unknown StepKind: " + str(decision.kind))
+
+    # --- Step handlers (filled in Turn 2) -------------------------------
+
+    async def _step_reasoning(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        agent_version_id: str,
+        config: AgentConfig,
+        nudge: bool,
+    ) -> None:
+        """One LLM call: write intent step, call LLM, write result step.
+
+        No DB transaction is held while the LLM is running. The intent step
+        is durable so resume can detect a crash mid-call.
+        """
+        # ---- Phase 1: build request in a short tx ----
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+
+            ctx_row = (
+                await s.execute(
+                    text(
+                        "SELECT messages, scratch FROM run_context "
+                        "WHERE execution_id = :e"
+                    ),
+                    {"e": run_id},
+                )
+            ).mappings().first()
+
+            if ctx_row is None:
+                # First reasoning step: seed run_context.
+                ctx_id = uuid7str()
+                await s.execute(
+                    text(
+                        "INSERT INTO run_context "
+                        "(id, org_id, execution_id, agent_version_id) "
+                        "VALUES (:i, :o, :e, :v)"
+                    ),
+                    {"i": ctx_id, "o": org_id, "e": run_id, "v": agent_version_id},
+                )
+                existing_messages: list[dict[str, Any]] = []
+                scratch: dict[str, Any] = {}
+            else:
+                existing_messages = list(ctx_row["messages"] or [])
+                scratch = dict(ctx_row["scratch"] or {})
+
+            messages = list(existing_messages)
+            if not messages:
+                messages.append({"role": "system", "content": config.instructions})
+
+            if nudge and not scratch.get("expected_terminal_nudge_issued"):
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "You have not yet completed the required action. "
+                        "You must call the expected terminal tool before finishing."
+                    ),
+                })
+                scratch["expected_terminal_nudge_issued"] = True
+
+            # Turn messages into LLMMessage objects
+            from app.adapters.llm.base import LLMMessage, LLMRequest, ToolSpec
+            llm_messages = [
+                LLMMessage(
+                    role=m["role"],
+                    content=m.get("content"),
+                )
+                for m in messages
+            ]
+            tools = [
+                ToolSpec(
+                    name=t.key,
+                    description=t.description,
+                    input_schema=t.input_schema,
+                )
+                for t in ()
+            ]
+
+            # Build from resolved tools the engine already has via agent config.
+            # NOTE: caller passes ResolvedTools; here we only have config.
+            # The loop is expected to have run a service resolve before
+            # run_once; for MVP we re-resolve tools from agent_tool_grants.
+            tool_rows = (
+                await s.execute(
+                    text(
+                        "SELECT t.key, t.description, t.input_schema "
+                        "FROM agent_tool_grants g JOIN tools t ON t.id = g.tool_id "
+                        "WHERE g.agent_version_id = :v ORDER BY t.key"
+                    ),
+                    {"v": agent_version_id},
+                )
+            ).mappings().all()
+            tools = [
+                ToolSpec(
+                    name=r["key"],
+                    description=r["description"],
+                    input_schema=r["input_schema"],
+                )
+                for r in tool_rows
+            ]
+
+            max_tokens = min(config.max_output_tokens, 1024)
+            request = LLMRequest(
+                model=config.model,
+                messages=llm_messages,
+                tools=tools,
+                temperature=config.temperature,
+                max_output_tokens=max_tokens,
+            )
+
+            step_id, _seq = await self._append_step(
+                s=s,
+                org_id=org_id,
+                run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="llm_request",
+                status="ok",
+                input_data={
+                    "model": config.model,
+                    "message_count": len(llm_messages),
+                    "tool_count": len(tools),
+                },
+                model=config.model,
+            )
+            await s.execute(
+                text(
+                    "UPDATE agent_runs SET iteration_count = iteration_count + 1 "
+                    "WHERE id = :i"
+                ),
+                {"i": run_id},
+            )
+
+        # ---- Phase 2: call LLM, no tx held ----
+        response = await self._llm.complete(request)
+
+        # ---- Phase 3: persist response in a short tx ----
+        cost = self._config.cost_for(
+            response.model,
+            response.usage.prompt_tokens,
+            response.usage.completion_tokens,
+        )
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+
+            await self._append_step(
+                s=s,
+                org_id=org_id,
+                run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="llm_response",
+                status="ok",
+                input_data={},
+                output_data={
+                    "content": response.content,
+                    "tool_call_count": len(response.tool_calls),
+                    "finish_reason": response.finish_reason,
+                    "tool_calls": [
+                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                        for tc in response.tool_calls
+                    ],
+                },
+                model=response.model,
+                tokens_in=response.usage.prompt_tokens,
+                tokens_out=response.usage.completion_tokens,
+                cost_usd=cost,
+            )
+
+            new_messages = list(messages)
+            new_messages.append(
+                {
+                    "role": "assistant",
+                    "content": response.content,
+                    "tool_calls": [
+                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                        for tc in response.tool_calls
+                    ],
+                }
+            )
+
+            await s.execute(
+                text(
+                    "UPDATE run_context "
+                    "SET messages = CAST(:m AS jsonb), scratch = CAST(:sc AS jsonb), "
+                    "    updated_at = now() "
+                    "WHERE execution_id = :e"
+                ),
+                {
+                    "m": _jsonb(new_messages),
+                    "sc": _jsonb(scratch),
+                    "e": run_id,
+                },
+            )
+            await s.execute(
+                text(
+                    "UPDATE agent_runs "
+                    "SET tokens_in = tokens_in + :ti, tokens_out = tokens_out + :to, "
+                    "    cost_usd = cost_usd + :c "
+                    "WHERE id = :i"
+                ),
+                {
+                    "ti": response.usage.prompt_tokens,
+                    "to": response.usage.completion_tokens,
+                    "c": cost,
+                    "i": run_id,
+                },
+            )
+
+    async def _step_policy_check(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        agent_version_id: str,
+        config: AgentConfig,
+    ) -> None:
+        """Deterministic checks on pending proposals. Writes tool_proposed or tool_rejected."""
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+
+            # Get the last llm_response output that has not been fully decided.
+            rows = (
+                await s.execute(
+                    text(
+                        "SELECT seq, output FROM execution_steps "
+                        "WHERE execution_id = :e AND type = 'llm_response' "
+                        "ORDER BY seq DESC LIMIT 1"
+                    ),
+                    {"e": run_id},
+                )
+            ).mappings().first()
+            if rows is None:
+                return
+
+            proposals_raw = (rows["output"] or {}).get("tool_calls", [])
+            decided_count = (
+                await s.execute(
+                    text(
+                        "SELECT COUNT(*) FROM execution_steps "
+                        "WHERE execution_id = :e AND seq > :sq "
+                        "AND type IN ('tool_proposed','tool_rejected')"
+                    ),
+                    {"e": run_id, "sq": int(rows["seq"])},
+                )
+            ).scalar_one()
+
+            if int(decided_count) >= len(proposals_raw):
+                return
+
+            proposal = proposals_raw[int(decided_count)]
+            tool_key = proposal["name"]
+
+            # Look up tool to verify it exists and is granted
+            tool_row = (
+                await s.execute(
+                    text(
+                        "SELECT t.id, t.key, t.risk_class, t.approval_policy, "
+                        "       t.idempotency_mode, t.input_schema, t.timeout_ms, "
+                        "       t.org_id AS tool_org "
+                        "FROM tools t "
+                        "JOIN agent_tool_grants g ON g.tool_id = t.id "
+                        "WHERE g.agent_version_id = :v AND t.key = :k"
+                    ),
+                    {"v": agent_version_id, "k": tool_key},
+                )
+            ).mappings().first()
+
+            if tool_row is None:
+                # Not granted: reject, increment consecutive_rejections
+                await self._append_step(
+                    s=s,
+                    org_id=org_id,
+                    run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    step_type="tool_rejected",
+                    status="ok",
+                    input_data={"tool": tool_key, "reason": "not_granted"},
+                )
+                await s.execute(
+                    text(
+                        "UPDATE run_context "
+                        "SET consecutive_rejections = consecutive_rejections + 1, "
+                        "    updated_at = now() "
+                        "WHERE execution_id = :e"
+                    ),
+                    {"e": run_id},
+                )
+                return
+
+            # Compute idempotency key if mode=keyed
+            idem_key: str | None = None
+            if tool_row["idempotency_mode"] == "keyed":
+                idem_key = compute_idempotency_key(
+                    execution_id=run_id,
+                    agent_version_id=agent_version_id,
+                    tool_id=str(tool_row["id"]),
+                    arguments=proposal["arguments"],
+                )
+
+            # Write the tool_proposed step. Actual execution is the next step.
+            await self._append_step(
+                s=s,
+                org_id=org_id,
+                run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="tool_proposed",
+                status="ok",
+                input_data={
+                    "tool": tool_key,
+                    "arguments": proposal["arguments"],
+                    "risk_class": tool_row["risk_class"],
+                    "approval_policy": tool_row["approval_policy"],
+                    "idempotency_mode": tool_row["idempotency_mode"],
+                    "idempotency_key": idem_key,
+                    "tool_id": str(tool_row["id"]),
+                    "call_id": proposal["id"],
+                    "tool_timeout_ms": int(tool_row["timeout_ms"]),
+                },
+            )
+            # Reset consecutive_rejections on first proposal
+            await s.execute(
+                text(
+                    "UPDATE run_context SET consecutive_rejections = 0, "
+                    "updated_at = now() WHERE execution_id = :e"
+                ),
+                {"e": run_id},
+            )
+
+    async def _step_tool_call(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        agent_version_id: str,
+        config: AgentConfig,
+    ) -> None:
+        """Execute one approved proposal. Writes tool_executing then tool_result."""
+        # Phase 1: read the proposal + persist intent
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+
+            last_proposed = (
+                await s.execute(
+                    text(
+                        "SELECT seq, input, output FROM execution_steps "
+                        "WHERE execution_id = :e AND type = 'tool_proposed' "
+                        "ORDER BY seq DESC LIMIT 1"
+                    ),
+                    {"e": run_id},
+                )
+            ).mappings().first()
+            if last_proposed is None:
+                raise EngineError("no tool_proposed step to execute")
+            proposed_input = last_proposed["input"]
+
+            # Check if a tool_executing step already exists for this
+            # proposal (recovery case).
+            already = (
+                await s.execute(
+                    text(
+                        "SELECT id, status FROM tool_calls "
+                        "WHERE execution_id = :e AND step_id = "
+                        "(SELECT id FROM execution_steps WHERE execution_id = :e "
+                        " AND seq = :sq)"
+                    ),
+                    {"e": run_id, "sq": int(last_proposed["seq"])},
+                )
+            ).first()
+
+            call_id = None
+            if already is not None:
+                call_id = already[0]
+            else:
+                await self._append_step(
+                    s=s,
+                    org_id=org_id,
+                    run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    step_type="tool_executing",
+                    status="executing",
+                    input_data={"tool": proposed_input["tool"]},
+                )
+                # The _persist_tool_call helper writes the tool_calls row
+                # with a status of 'executing'.
+                tool = self._tool_from_proposal(proposed_input)
+                call_id = await self._persist_tool_call(
+                    s=s,
+                    org_id=org_id,
+                    run_id=run_id,
+                    step_id="",  # The step_id FK isn't required to be set for MVP
+                    agent_version_id=agent_version_id,
+                    tool=tool,
+                    arguments=proposed_input["arguments"],
+                    idempotency_key=proposed_input.get("idempotency_key"),
+                    status="executing",
+                )
+
+        # Phase 2: execute tool with timeout, NO tx held
+        tool = self._tool_from_proposal(proposed_input)
+        executor = self._tool_registry.executor_for(tool.key)
+        timeout_s = float(proposed_input.get("tool_timeout_ms", 15000)) / 1000.0
+        try:
+            result = await asyncio.wait_for(
+                executor(
+                    tool=tool,
+                    arguments=proposed_input["arguments"],
+                    idempotency_key=proposed_input.get("idempotency_key"),
+                    timeout_seconds=timeout_s,
+                ),
+                timeout=timeout_s + 5.0,
+            )
+        except asyncio.TimeoutError:
+            result = ToolResult(ok=False, error=TimeoutError("tool timeout"))
+        except Exception as exc:
+            result = ToolResult(ok=False, error=exc)
+
+        # Phase 3: run post_check if present (no tx held)
+        verified: bool | None = result.verified
+        post_check_exc: BaseException | None = None
+        if result.ok:
+            post_check = self._tool_registry.post_check_for(tool.key)
+            if post_check is not None:
+                try:
+                    verified = await post_check(
+                        proposed_input["arguments"], result.output
+                    )
+                except Exception as exc:
+                    post_check_exc = exc
+                    verified = None
+
+        # Phase 4: persist result in a short tx
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+
+            call_status = "completed" if result.ok else "failed"
+            await s.execute(
+                text(
+                    "UPDATE tool_calls "
+                    "SET status = :st, output = CAST(:out AS jsonb), "
+                    "    output_redacted = true, verified = :v, finished_at = now(), "
+                    "    error = CAST(:err AS jsonb) "
+                    "WHERE id = :i"
+                ),
+                {
+                    "st": call_status,
+                    "out": _jsonb(redact(result.output)) if result.ok else None,
+                    "v": verified,
+                    "err": (
+                        _jsonb(redact(_error_dict(result.error)))
+                        if result.error else None
+                    ),
+                    "i": call_id,
+                },
+            )
+
+            await self._append_step(
+                s=s,
+                org_id=org_id,
+                run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="tool_result",
+                status="ok" if result.ok else "failed",
+                input_data={"tool": tool.key},
+                output_data=redact(result.output) if result.ok else {},
+                error=(
+                    redact(_error_dict(result.error)) if result.error else None
+                ),
+            )
+
+            await s.execute(
+                text(
+                    "UPDATE agent_runs SET tool_call_count = tool_call_count + 1 "
+                    "WHERE id = :i"
+                ),
+                {"i": run_id},
+            )
+
+            # Update messages to include the tool result turn
+            ctx_row = (
+                await s.execute(
+                    text("SELECT messages FROM run_context WHERE execution_id = :e"),
+                    {"e": run_id},
+                )
+            ).mappings().first()
+            if ctx_row is not None:
+                messages = list(ctx_row["messages"] or [])
+                messages.append(
+                    {
+                        "role": "tool",
+                        "content": (
+                            _jsonb(result.output) if result.ok
+                            else _jsonb(_error_dict(result.error))
+                        ),
+                        "tool_call_id": proposed_input.get("call_id"),
+                        "name": tool.key,
+                    }
+                )
+                await s.execute(
+                    text(
+                        "UPDATE run_context SET messages = CAST(:m AS jsonb), "
+                        "updated_at = now() WHERE execution_id = :e"
+                    ),
+                    {"m": _jsonb(messages), "e": run_id},
+                )
+
+            # Post-check exception escalation for external/irreversible
+            if post_check_exc is not None and tool.risk_class in (
+                "external_communication", "irreversible_write"
+            ):
+                esc_id = await self._write_escalation(
+                    s=s,
+                    org_id=org_id,
+                    run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="verification_error",
+                    context={
+                        "tool_call_id": call_id,
+                        "error_type": type(post_check_exc).__name__,
+                    },
+                    tool_call_id=call_id,
+                )
+                await self._write_terminated(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="escalated",
+                    detail={
+                        "reason": "verification_error",
+                        "escalation_id": esc_id,
+                    },
+                )
+
+    def _tool_from_proposal(self, proposed_input: dict[str, Any]) -> ResolvedTool:
+        # Reconstruct a ResolvedTool from the persisted proposal fields.
+        return ResolvedTool(
+            id=proposed_input["tool_id"],
+            key=proposed_input["tool"],
+            name=proposed_input["tool"],
+            description="",
+            input_schema={},
+            output_schema={},
+            risk_class=proposed_input["risk_class"],
+            approval_policy=proposed_input["approval_policy"],
+            timeout_ms=int(proposed_input.get("tool_timeout_ms", 15000)),
+            idempotency_mode=proposed_input["idempotency_mode"],
+            grant_config={},
+        )
+
+    async def _step_verifying(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        agent_version_id: str,
+        config: AgentConfig,
+        nudge: bool,
+    ) -> TerminalReason | None:
+        """Final outcome check. Writes terminated(completed) or escalates."""
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+
+            expected = config.expected_terminal_tool
+            satisfied = False
+            if expected is not None:
+                row = (
+                    await s.execute(
+                        text(
+                            "SELECT status, verified FROM tool_calls "
+                            "WHERE execution_id = :e AND tool_key_snapshot = :k "
+                            "ORDER BY started_at DESC LIMIT 1"
+                        ),
+                        {"e": run_id, "k": expected},
+                    )
+                ).mappings().first()
+                if row is not None and row["status"] == "completed":
+                    if not config.require_verified_terminal or row["verified"] is True:
+                        satisfied = True
+
+            if expected is not None and not satisfied:
+                await self._append_step(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    step_type="verified", status="failed",
+                    input_data={"expected": expected, "satisfied": False},
+                )
+                esc_id = await self._write_escalation(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="expected_tool_not_executed",
+                    context={"expected_tool": expected},
+                )
+                await self._write_terminated(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="escalated",
+                    detail={
+                        "reason": "expected_tool_not_executed",
+                        "escalation_id": esc_id,
+                    },
+                )
+                return "escalated"
+
+            await self._append_step(
+                s=s, org_id=org_id, run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="verified", status="ok",
+                input_data={"expected": expected, "satisfied": satisfied},
+            )
+            await self._write_terminated(
+                s=s, org_id=org_id, run_id=run_id,
+                agent_version_id=agent_version_id,
+                reason="completed",
+            )
+            return "completed"
+
+
+
+@dataclass(frozen=True)
+class _LoadedState:
+    steps: tuple[Any, ...]
+    counters: dict[str, Any]
+    consecutive_rejections: int
+    nudge_issued: bool
+    config: AgentConfig
+    terminal_tool_status: TerminalToolStatus
+    pending_proposal_count: int
+    last_step_type: str | None
+    agent_version_id: str
+    version: int
+    status: str
+
 
 __all__ = ["RuntimeEngine"]
+
+
+def _error_dict(exc: BaseException | None) -> dict[str, Any]:
+    if exc is None:
+        return {}
+    return {
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
