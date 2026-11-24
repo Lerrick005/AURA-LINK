@@ -1,4 +1,4 @@
-"""Pydantic contracts for the agent engine.
+﻿"""Pydantic contracts for the agent engine.
 
 Two shapes:
 - ``AgentConfig`` is the JSONB stored in agent_versions.config. Validated on
@@ -77,9 +77,9 @@ class AgentConfig(BaseModel):
     limits: AgentLimits = Field(default_factory=AgentLimits)
     memory: AgentMemoryConfig = Field(default_factory=AgentMemoryConfig)
     escalation: EscalationRules = Field(default_factory=EscalationRules)
-
     expected_terminal_tool: str | None = None
     require_verified_terminal: bool = True
+
 
     @field_validator("instructions")
     @classmethod
@@ -123,3 +123,4 @@ class ResolvedAgentConfig(BaseModel):
     # Knowledge scope: for MVP, all documents in the org. Collection-based
     # scoping lands later; this field exists so the runtime never has to guess.
     knowledge_scope_all_org_documents: bool = True
+
