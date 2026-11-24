@@ -118,6 +118,7 @@ class EngineConfig:
     lease_ttl_seconds: int
     heartbeat_interval_seconds: int
     max_consecutive_rejections: int = 3
+    max_nodes_executed: int = 100
     pricing_per_million_usd: dict[str, tuple[Decimal, Decimal]] = field(
         default_factory=lambda: {
             "gpt-4o-mini": (Decimal("0.15"), Decimal("0.60")),
@@ -234,3 +235,4 @@ __all__ = [
 MAX_MESSAGES: int = 100
 MAX_MESSAGE_TOTAL_BYTES: int = 500_000
 MAX_MESSAGES_RECENT_KEEP: int = 10
+

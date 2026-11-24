@@ -268,3 +268,56 @@ async def list_agents(session: AsyncSession, *, org_id: str) -> list[Agent]:
         select(Agent).where(Agent.org_id == org_id).order_by(Agent.created_at.desc())
     )
     return list(result.scalars().all())
+
+
+class AgentRunError(Exception):
+    """Base for run-lifecycle errors."""
+
+
+class AgentRunNotFound(AgentRunError):
+    pass
+
+
+async def start_run(
+    session: AsyncSession, *, org_id: str, agent_id: str,
+    input_data: dict, workflow_version_id: str | None = None,
+) -> str:
+    """Create an agent_runs row in 'pending' status. Returns run_id.
+
+    Caller must subsequently invoke RuntimeEngine.run_once(run_id, org_id).
+
+    The workflow_version_id is None for plain agent runs (Stage 2 API path)
+    and set for agent nodes within a workflow (Stage 3+). It is stored on
+    agent_runs so a sub-run can be traced back to its parent workflow.
+
+    Input shape:
+    - Plain agent runs:    {"task": "do the thing"}
+    - Workflow runs:       {"trigger_input": {...}, "workflow": "..."}
+    - Agent node sub-runs: {"task": "...", "parent_run_id": "..."}
+    """
+    agent = await session.get(Agent, agent_id)
+    if agent is None or agent.org_id != org_id:
+        raise AgentNotFound(agent_id)
+    if agent.current_version_id is None or agent.status != "active":
+        raise AgentNotDeployed(agent_id)
+
+    run_id = uuid7str()
+    await session.execute(
+        text(
+            "INSERT INTO agent_runs "
+            "(id, org_id, agent_version_id, status, input, workflow_version_id) "
+            "VALUES (:id, :o, :v, 'pending', CAST(:inp AS jsonb), :wv)"
+        ),
+        {
+            "id": run_id,
+            "o": org_id,
+            "v": agent.current_version_id,
+            "inp": __import__("json").dumps(input_data),
+            "wv": workflow_version_id,
+        },
+    )
+    await session.flush()
+    return run_id
+
+
+__all__.append("start_run")
