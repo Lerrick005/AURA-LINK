@@ -32,7 +32,7 @@ from app.modules.agents.service import start_run
 from app.modules.runtime.engine import RuntimeEngine
 from app.modules.runtime.types import EngineConfig, TerminalReason
 from app.modules.workflows.decision import decide_next_node
-from app.modules.workflows.schemas import WorkflowGraph
+from app.modules.workflows.schemas import Node, NodeConfig, NodeType, WorkflowGraph
 from app.modules.workflows.types import (
     NodeDecision,
     NodeExec,
@@ -322,18 +322,12 @@ class WorkflowEngine(RuntimeEngine):
 
         if terminal != TERMINAL_COMPLETED:
             # Sub-run failed, escalated, timed out, etc. Propagate as workflow terminal.
-            async with tenant_session(org_id) as s:
-                await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
-                await self._write_terminated(
-                    s=s, org_id=org_id, run_id=run_id,
-                    agent_version_id=agent_version_id,
-                    reason=terminal,
-                    detail={
-                        "node_id": node.id,
-                        "sub_run_id": sub_run_id,
-                        "sub_terminal": terminal,
-                    },
-                )
+            # The loop's exception handler owns the single terminal write.
+            # Writing here AND raising causes a double _write_terminated,
+            # which sets status='escalated' and then StaleLeaseError on the second fence.
+            raise WorkflowEngineError(
+                f"agent node {node.id!r} sub-run terminal={terminal}"
+            )
             # Signal the loop to exit by raising — the loop writes terminated
             # but only if it sees terminal state; cleaner to raise a sentinel.
             # For MVP: return and let the loop detect the written terminated step.
@@ -362,9 +356,6 @@ class WorkflowEngine(RuntimeEngine):
             if wv_id is None:
                 # Not a workflow run. Return a stub with empty graph; run_once
                 # will raise WorkflowNotDeployed before using it.
-                from app.modules.workflows.schemas import (
-                    WorkflowGraph, Node, NodeType, NodeConfig,
-                )
                 stub = WorkflowGraph(
                     entry_node_id="_none",
                     nodes=[Node(id="_none", type=NodeType.TERMINATE,
@@ -461,4 +452,5 @@ class _LoadedWorkflowState:
 
 
 __all__ = ["WorkflowEngine", "WorkflowEngineError", "WorkflowNotFound", "WorkflowNotDeployed"]
+
 

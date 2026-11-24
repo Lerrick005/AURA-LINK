@@ -154,6 +154,7 @@ class RuntimeEngine:
         tokens_in: int | None = None,
         tokens_out: int | None = None,
         cost_usd: Decimal | None = None,
+        node_id: str | None = None,
         error: dict[str, Any] | None = None,
     ) -> tuple[str, int]:
         seq = int(
@@ -172,10 +173,10 @@ class RuntimeEngine:
             text(
                 "INSERT INTO execution_steps "
                 "(id, org_id, execution_id, agent_version_id, seq, type, status, "
-                " input, output, model, tokens_in, tokens_out, cost_usd, finished_at, error) "
+                " input, output, model, tokens_in, tokens_out, cost_usd, node_id, finished_at, error) "
                 "VALUES "
                 "(:id, :o, :e, :v, :seq, :t, :st, "
-                " CAST(:inp AS jsonb), CAST(:out AS jsonb), :m, :ti, :to, :c, now(), "
+                " CAST(:inp AS jsonb), CAST(:out AS jsonb), :m, :ti, :to, :c, :node_id, now(), "
                 " CAST(:err AS jsonb))"
             ),
             {
@@ -193,6 +194,7 @@ class RuntimeEngine:
                 "to": tokens_out,
                 "c": cost_usd,
                 "err": _jsonb(redact(error)) if error else None,
+                "node_id": node_id,
             },
         )
         return step_id, seq
@@ -1646,6 +1648,8 @@ def _error_dict(exc: BaseException | None) -> dict[str, Any]:
         "error_type": type(exc).__name__,
         "message": str(exc),
     }
+
+
 
 
 
