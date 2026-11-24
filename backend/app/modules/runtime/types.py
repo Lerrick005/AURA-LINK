@@ -96,6 +96,11 @@ class RepeatedRejectionError(EngineError):
     """Too many consecutive tool proposals rejected by policy."""
 
 
+
+# Named constant: used by decision.py (escalate on repeated rejections)
+# and engine.py (rejection-cap helper). Single source of truth.
+ESCALATION_REASON_REJECTION_CAP = "tool_rejections_exceeded"
+
 TerminalReason = Literal[
     "completed",
     "failed",
@@ -220,3 +225,12 @@ __all__ = [
     "LLMResponse",
     "ToolCall",
 ]
+
+
+# --- run_context.messages size caps (F3) ---
+# Safety limits, not configuration. A runaway run must not grow its
+# run_context.messages row without bound. Chosen so a 50-iteration run
+# with verbose tool outputs stays under ~500 KB.
+MAX_MESSAGES: int = 100
+MAX_MESSAGE_TOTAL_BYTES: int = 500_000
+MAX_MESSAGES_RECENT_KEEP: int = 10

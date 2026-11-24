@@ -1,4 +1,4 @@
-"""SQLAlchemy models for the agent engine (Milestone 2 first slice).
+﻿"""SQLAlchemy models for the agent engine (Milestone 2 first slice).
 
 Design notes:
 - All primary keys are UUIDv7 strings (app-generated via app.core.ids). The
@@ -9,7 +9,7 @@ Design notes:
 - agent_versions are immutable: no updated_at. Service layer refuses UPDATE.
 - Agent configuration is JSONB. Pydantic validates at the service boundary;
   the DB stores it opaquely.
-- agent_runs is the first slice of the executions table in blueprint §11.2.
+- agent_runs is the first slice of the executions table in blueprint Â§11.2.
   execution_steps and tool_calls land with the runtime state machine.
 - RLS is enforced in the Alembic migration, not in the model. Every table with
   org_id gets ENABLE + FORCE ROW LEVEL SECURITY + policy using
@@ -166,7 +166,26 @@ class AgentRun(Base):
     tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     cost_usd: Mapped[float] = mapped_column(Numeric(12, 6), nullable=False, default=0)
 
+    # Lease / fencing columns (managed by engine.py via raw SQL; mapped here
+    # so ORM reads of AgentRun see the full row and so autogenerate drift
+    # checks pass. Do not edit lease state through the ORM.)
+    lease_holder: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    lease_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    lease_epoch: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    current_step_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
     __table_args__ = (
         Index("ix_agent_runs_org_status", "org_id", "status"),
         Index("ix_agent_runs_org_started", "org_id", "started_at"),
     )
+
+
+

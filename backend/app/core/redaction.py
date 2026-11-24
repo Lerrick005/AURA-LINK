@@ -96,3 +96,41 @@ def redact_error(exc: BaseException) -> dict[str, Any]:
         "message": redact(str(exc)),
         "args": redact(list(exc.args)),
     }
+
+
+# --- audit meta redaction (added for audit/service.py) ---
+_AUDIT_SENSITIVE_KEYS = frozenset({
+    "password", "passwd", "secret", "token", "access_token", "refresh_token",
+    "api_key", "apikey", "authorization", "cookie", "set-cookie",
+    "private_key", "session_id", "bearer", "jwt", "credential",
+})
+
+
+def redact_audit_meta(value, *, _depth=0):
+    """Redact known-sensitive KEYS in audit metadata, keep other values.
+
+    Differs from redact(): redact() is fail-closed for all strings
+    (used by engine.py execution data); redact_audit_meta is fail-open
+    for non-sensitive keys because the audit trail must be operator-readable.
+    Depth-capped at 32.
+    """
+    if _depth > 32:
+        return "<truncated:depth>"
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            ks = str(k)
+            if ks.lower() in _AUDIT_SENSITIVE_KEYS:
+                out[ks] = "<redacted:sensitive>"
+            else:
+                out[ks] = redact_audit_meta(v, _depth=_depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [redact_audit_meta(v, _depth=_depth + 1) for v in value]
+    if isinstance(value, (bytes, bytearray)):
+        return "<redacted:bytes>"
+    if isinstance(value, str):
+        if len(value) > 512:
+            return value[:512] + "<truncated>"
+        return value
+    return value
