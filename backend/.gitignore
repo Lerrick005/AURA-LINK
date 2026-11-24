@@ -1,0 +1,3 @@
+﻿*.bak_*
+audit_output.txt
+diag_*.py

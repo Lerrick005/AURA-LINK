@@ -186,8 +186,8 @@ class RuntimeEngine:
                 "seq": seq,
                 "t": step_type,
                 "st": status,
-                "inp": _jsonb(redact(input_data or {})),
-                "out": _jsonb(redact(output_data or {})),
+                "inp": _jsonb(self._redact_step_input(step_type, input_data)),
+                "out": _jsonb(self._redact_step_output(step_type, output_data)),
                 "m": model,
                 "ti": tokens_in,
                 "to": tokens_out,
@@ -196,6 +196,60 @@ class RuntimeEngine:
             },
         )
         return step_id, seq
+
+    def _redact_step_input(self, step_type: str, data: dict | None) -> dict:
+        """Redact step input, preserving fields the engine reads back.
+
+        step types whose input is engine state (read back by later steps)
+        keep their structure. step types whose input is user/tool data get
+        redacted normally. The distinction is important: redacting
+        tool_proposed.input.tool_id makes _step_tool_call unable to
+        resolve the tool row and the run fails silently.
+        """
+        if not data:
+            return {}
+
+        if step_type == "tool_proposed":
+            # Engine reads tool_id, arguments, call_id, idempotency_key,
+            # idempotency_mode, risk_class, approval_policy, tool_timeout_ms.
+            # Preserve the whole dict; it is engine state, not user data.
+            return dict(data)
+
+        if step_type in ("tool_executing", "tool_result"):
+            preserved = {"tool", "call_id", "tool_id"}
+            out = {}
+            for k, v in data.items():
+                out[k] = v if k in preserved else redact(v)
+            return out
+
+        if step_type == "tool_rejected":
+            preserved = {"tool", "reason", "tool_call_id", "tool_id"}
+            out = {}
+            for k, v in data.items():
+                out[k] = v if k in preserved else redact(v)
+            return out
+
+        # Default: redact everything (llm_request, terminated, verified, etc.)
+        return redact(data)
+
+    def _redact_step_output(self, step_type: str, data: dict | None) -> dict:
+        """Redact step output, preserving structure the engine reads back.
+
+        llm_response.output carries tool_calls[]; the engine extracts
+        name/id/arguments from it on the next iteration. Redacting those
+        breaks the tool path. We keep the tool_calls array verbatim and
+        redact only the content field.
+        """
+        if not data:
+            return {}
+        if step_type == "llm_response":
+            out = dict(data)
+            if isinstance(out.get("content"), str):
+                out["content"] = redact(out["content"])
+            # tool_calls[] preserved as-is: id, name, arguments are engine state.
+            return out
+        return redact(data)
+
     # --- Budget / time -------------------------------------------------
     async def _budget_or_terminal(
         self,
@@ -1592,5 +1646,7 @@ def _error_dict(exc: BaseException | None) -> dict[str, Any]:
         "error_type": type(exc).__name__,
         "message": str(exc),
     }
+
+
 
 
