@@ -37,6 +37,8 @@ from app.modules.runtime.types import (
     StaleLeaseError,
     TerminalReason,
     ToolRegistry,
+    ToolResult,
+    compute_idempotency_key,
 )
 log = get_logger(__name__)
 TERMINAL_REASONS: frozenset[str] = frozenset(
@@ -845,6 +847,18 @@ class RuntimeEngine:
             messages = list(existing_messages)
             if not messages:
                 messages.append({"role": "system", "content": config.instructions})
+                run_input = (
+                    await s.execute(
+                        text("SELECT input FROM agent_runs WHERE id = :i"),
+                        {"i": run_id},
+                    )
+                ).scalar_one()
+                if isinstance(run_input, str):
+                    run_input = json.loads(run_input)
+                task = (run_input or {}).get("message")
+                if not isinstance(task, str) or not task.strip():
+                    task = _jsonb(run_input or {})
+                messages.append({"role": "user", "content": task})
             if nudge and not scratch.get("expected_terminal_nudge_issued"):
                 messages.append({
                     "role": "system",
@@ -1286,6 +1300,14 @@ class RuntimeEngine:
             tool = await self._load_full_tool(
                 s=s, tool_id=proposed_input["tool_id"]
             )
+            try:
+                executor = self._tool_registry.executor_for(tool.key)
+            except EngineError:
+                await self._escalate_misconfigured(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id, tool_key=tool.key,
+                )
+                return
 
             prior = (
                 await s.execute(
@@ -1337,7 +1359,6 @@ class RuntimeEngine:
                 )
                 return
         # Phase 2: execute tool with timeout, NO tx held
-        executor = self._tool_registry.executor_for(tool.key)
         # SECURITY FIX: Timeout enforced from tool config, not LLM proposal.
         timeout_s = float(tool.timeout_ms) / 1000.0 if tool.timeout_ms else 15.0
         timed_out = False
