@@ -1,20 +1,42 @@
-﻿# ADR-0007: RunPrimitives Extraction Deferral
+﻿# ADR-0007: RunPrimitives Extraction Deferred to Stage 3.5
 
 Status: Accepted
 Date: 2026-11-24
 
 ## Context
-`WorkflowEngine` inherits from `RuntimeEngine` to reuse lease, fencing, and step-writing logic. However, as seen in 3.1d and 3.1e, `WorkflowEngine` is forced to override methods like `_redact_step_output` and add parallel methods like `_resolve_tool_by_key` because the workflow execution context differs from the agent execution context.
+`WorkflowEngine(RuntimeEngine)` inherits lease, fencing, heartbeat, step-write,
+and terminal-state primitives. Over Stage 3.1 we accumulated three concrete
+override sites that exist solely because WorkflowEngine is a subclass:
+
+1. `_redact_step_output` — condition steps carry routing state that must not
+   be redacted (chosen_next_node_id).
+2. `_load_state` — returns `WorkflowState`, not `RunState`.
+3. `_resolve_tool_by_key` — new helper, because RuntimeEngine only resolves by id.
+
+These overrides are the evidence the ADR-004 revisit trigger asked for.
 
 ## Decision
-We will defer the extraction of a `RunPrimitives` composition object (to replace inheritance) until Stage 3.2. 
-For now, inheritance remains the pragmatic choice for MVP. The `WorkflowEngine` cleanly overrides the state loader and specific dispatch/redaction methods without touching the core lease mechanics.
+Defer the extraction of a `RunPrimitives` composition object. Keep the
+inheritance for now. Extract when the next engine (or the next permission-
+context divergence) lands — realistically Stage 3.5 alongside approval gates.
+
+## Alternatives Considered
+- Extract now: cleaner architecture, but adds a refactor between shipped
+  features and the next feature, with no user-visible benefit yet.
+- Mixin: same coupling problem as inheritance.
+- Composition: correct eventual shape, but too early without a third consumer.
 
 ## Consequences
-- Negative: Technical debt. `WorkflowEngine` is coupled to `RuntimeEngine`'s internal method signatures (`_fence_and_heartbeat`, `_append_step`).
-- Positive: We shipped Stage 3.1 significantly faster.
-- Positive: We now have concrete evidence of *what* needs to be extracted (redaction overrides, tool resolution, terminal writes).
+- Negative: three override methods that would live in one place in a
+  composition design.
+- Positive: shipped Stage 3.1–3.3 faster with no user-facing bugs from the
+  inheritance coupling.
+- Positive: the override sites are documented (this ADR) so extraction is
+  bounded work, not a discovery exercise.
 
 ## Revisit When
-- Stage 3.2 (API layer) is complete.
-- We need to introduce a third execution engine (e.g., a background batch processor).
+- Stage 3.5 (approval gates) needs workflow-specific pause semantics that
+  do not map onto RuntimeEngine's verification/step model.
+- A third execution engine (batch processor, long-running timer, etc.) is
+  introduced.
+- The override count exceeds 5.
