@@ -221,4 +221,44 @@ __all__ = [
     "DuplicateWorkflowName", "InvalidWorkflowGraph", "WorkflowNotDeployed",
     "create_workflow", "create_version", "deploy_version",
     "get_workflow", "list_workflows", "resolve_runtime_graph",
+    "start_workflow_run",
 ]
+
+async def start_workflow_run(
+    session: AsyncSession,
+    *,
+    org_id: str,
+    workflow_id: str,
+    input_data: dict,
+) -> str:
+    """Create a pending agent_runs row for a workflow execution.
+
+    Workflow runs have NULL agent_version_id (they are not agent executions).
+    The workflow_version_id is resolved from the currently deployed version,
+    so deploying a new version while an old run is in flight does not change
+    what that run executes.
+    """
+    import json as _json
+    from sqlalchemy import text as _text
+    from app.core.ids import uuid7str as _uuid7str
+
+    _, ver, _ = await resolve_runtime_graph(
+        session, org_id=org_id, workflow_id=workflow_id
+    )
+
+    run_id = _uuid7str()
+    await session.execute(
+        _text(
+            "INSERT INTO agent_runs "
+            "(id, org_id, agent_version_id, workflow_version_id, status, input) "
+            "VALUES (:id, :o, NULL, :wv, 'pending', CAST(:inp AS jsonb))"
+        ),
+        {
+            "id": run_id,
+            "o": org_id,
+            "wv": ver.id,
+            "inp": _json.dumps(input_data),
+        },
+    )
+    await session.flush()
+    return run_id
