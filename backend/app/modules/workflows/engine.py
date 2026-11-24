@@ -32,6 +32,7 @@ from app.modules.agents.service import start_run
 from app.modules.runtime.engine import RuntimeEngine
 from app.modules.runtime.types import EngineConfig, TerminalReason
 from app.modules.workflows.decision import decide_next_node
+from app.modules.workflows.expression import ExpressionError, evaluate
 from app.modules.workflows.schemas import Node, NodeConfig, NodeType, WorkflowGraph
 from app.modules.workflows.types import (
     NodeDecision,
@@ -193,8 +194,14 @@ class WorkflowEngine(RuntimeEngine):
                             detail={"node_id": node.id},
                         )
                     return reason
+                elif node.type.value == "condition":
+                    await self._step_condition(
+                        run_id=run_id, org_id=org_id, epoch=epoch,
+                        agent_version_id=loaded.agent_version_id,
+                        node=node,
+                    )
                 else:
-                    # Condition, tool: not yet supported in 3.1c.
+                    # Tool node: not yet supported in 3.1e.
                     raise WorkflowEngineError(
                         f"node type not yet supported: {node.type.value!r}"
                     )
@@ -212,6 +219,21 @@ class WorkflowEngine(RuntimeEngine):
                         detail={"node_id": node.id, "error": str(exc)},
                     )
                 return TERMINAL_ESCALATED
+
+    # --- Node handlers ---------------------------------------------------
+
+    # --- Redaction override ---------------------------------------------
+
+    def _redact_step_output(self, step_type: str, data: dict | None) -> dict:
+        """Condition steps write engine-internal routing decisions.
+
+        `chosen_next_node_id` is read back by decide_next_node on the next
+        cycle. Redacting it makes the graph unroutable, so we preserve the
+        entire condition-step output verbatim.
+        """
+        if step_type == "condition" and data is not None:
+            return data
+        return super()._redact_step_output(step_type, data)
 
     # --- Node handlers ---------------------------------------------------
 
@@ -335,6 +357,68 @@ class WorkflowEngine(RuntimeEngine):
             # the state still has last_node_id = trigger. So we escalate here.
             raise WorkflowEngineError(
                 f"agent node {node.id!r} sub-run terminal={terminal}"
+            )
+
+    async def _step_condition(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        agent_version_id: str,
+        node,
+    ) -> None:
+        """Evaluate condition branches in order, record the chosen path.
+
+        The first branch whose `when` expression evaluates truthy is taken.
+        If no branch matches (e.g. no catch-all with `when: True`), the
+        condition is a graph design error and we escalate.
+        """
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+            run = (await s.execute(
+                text("SELECT input FROM agent_runs WHERE id = :i"),
+                {"i": run_id},
+            )).mappings().one()
+            context = run["input"] or {}
+
+            if not node.branches:
+                raise WorkflowEngineError(
+                    f"condition node {node.id!r}: no branches"
+                )
+
+            chosen: str | None = None
+            evaluation_log: list[dict] = []
+            for i, branch in enumerate(node.branches):
+                try:
+                    result = evaluate(branch.when, context)
+                except ExpressionError as exc:
+                    raise WorkflowEngineError(
+                        f"condition node {node.id!r} branch {i}: {exc}"
+                    ) from exc
+                evaluation_log.append({"branch_index": i, "result": bool(result)})
+                if result:
+                    chosen = branch.next
+                    break
+
+            if chosen is None:
+                raise WorkflowEngineError(
+                    f"condition node {node.id!r}: no branch matched "
+                    f"(evaluated {len(evaluation_log)} branch(es))"
+                )
+
+            await self._append_step(
+                s=s, org_id=org_id, run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="condition",
+                status="ok",
+                input_data={"node_id": node.id, "context": context},
+                output_data={
+                    "node_id": node.id,
+                    "chosen_next_node_id": chosen,
+                    "evaluations": evaluation_log,
+                },
+                node_id=node.id,
             )
 
     # --- State loader ----------------------------------------------------

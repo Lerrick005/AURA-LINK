@@ -16,7 +16,7 @@ from app.core.ids import uuid7str
 from app.modules.runtime.engine import RuntimeEngine
 from app.modules.runtime.types import EngineConfig
 from app.modules.workflows.engine import WorkflowEngine
-from app.modules.workflows.schemas import Node, NodeConfig, NodeType, WorkflowGraph
+from app.modules.workflows.schemas import Branch, Node, NodeConfig, NodeType, WorkflowGraph
 from app.modules.workflows.service import create_workflow, create_version as create_wf_version, deploy_version
 from app.modules.workflows.types import TERMINAL_COMPLETED, TERMINAL_ESCALATED
 
@@ -182,4 +182,101 @@ async def test_workflow_agent_failure_escalates(world, engine):
         assert run.terminal_reason == "escalated"
 
 
+@pytest.mark.asyncio
+async def test_workflow_condition_routes_true_branch(world, engine):
+    """Condition evaluates to True -> routes to true branch."""
+    org_id = world.a.org_id
+    graph = WorkflowGraph(
+        entry_node_id="start",
+        nodes=[
+            Node(id="start", type=NodeType.TRIGGER, next="check"),
+            Node(
+                id="check", type=NodeType.CONDITION,
+                branches=[
+                    Branch(when={"==": [{"var": "task"}, "vip"]}, next="end_vip"),
+                    Branch(when=True, next="end_std"),
+                ],
+            ),
+            Node(id="end_vip", type=NodeType.TERMINATE, config=NodeConfig(reason="completed")),
+            Node(id="end_std", type=NodeType.TERMINATE, config=NodeConfig(reason="completed")),
+        ],
+    )
+    # _setup_workflow_run hardcodes {"task": "test"} — override to "vip"
+    run_id, _ = await _setup_workflow_run(org_id, graph)
+    async with tenant_session(org_id) as s:
+        await s.execute(
+            text("UPDATE agent_runs SET input = CAST(:inp AS jsonb) WHERE id = :i"),
+            {"inp": json.dumps({"task": "vip"}), "i": run_id},
+        )
 
+    terminal = await engine.run_once(run_id=run_id, org_id=org_id)
+    assert terminal == "completed"
+
+    async with tenant_session(org_id) as s:
+        steps = (await s.execute(
+            text("SELECT type, node_id, output FROM execution_steps WHERE execution_id = :id ORDER BY seq"),
+            {"id": run_id},
+        )).all()
+        # trigger, condition, terminate
+        assert len(steps) == 3
+        assert steps[1].type == "condition"
+        assert steps[1].output["chosen_next_node_id"] == "end_vip"
+
+
+@pytest.mark.asyncio
+async def test_workflow_condition_routes_false_branch(world, engine):
+    """Condition evaluates to False -> routes to catch-all."""
+    org_id = world.a.org_id
+    graph = WorkflowGraph(
+        entry_node_id="start",
+        nodes=[
+            Node(id="start", type=NodeType.TRIGGER, next="check"),
+            Node(
+                id="check", type=NodeType.CONDITION,
+                branches=[
+                    Branch(when={"==": [{"var": "task"}, "vip"]}, next="end_vip"),
+                    Branch(when=True, next="end_std"),
+                ],
+            ),
+            Node(id="end_vip", type=NodeType.TERMINATE, config=NodeConfig(reason="completed")),
+            Node(id="end_std", type=NodeType.TERMINATE, config=NodeConfig(reason="completed")),
+        ],
+    )
+    run_id, _ = await _setup_workflow_run(org_id, graph)
+    # input is {"task": "test"} — doesn't match "vip", falls through to catch-all
+
+    terminal = await engine.run_once(run_id=run_id, org_id=org_id)
+    assert terminal == "completed"
+
+    async with tenant_session(org_id) as s:
+        steps = (await s.execute(
+            text("SELECT type, node_id, output FROM execution_steps WHERE execution_id = :id ORDER BY seq"),
+            {"id": run_id},
+        )).all()
+        assert len(steps) == 3
+        assert steps[1].output["chosen_next_node_id"] == "end_std"
+
+
+@pytest.mark.asyncio
+async def test_workflow_condition_no_match_escalates(world, engine):
+    """Condition with no matching branch and no catch-all -> escalate."""
+    org_id = world.a.org_id
+    graph = WorkflowGraph(
+        entry_node_id="start",
+        nodes=[
+            Node(id="start", type=NodeType.TRIGGER, next="check"),
+            Node(
+                id="check", type=NodeType.CONDITION,
+                branches=[
+                    Branch(when={"==": [{"var": "task"}, "vip"]}, next="end_vip"),
+                    Branch(when={"==": [{"var": "task"}, "priority"]}, next="end_vip"),
+                ],
+            ),
+            Node(id="end_vip", type=NodeType.TERMINATE, config=NodeConfig(reason="completed")),
+        ],
+    )
+    # input {"task": "test"} matches neither
+    run_id, _ = await _setup_workflow_run(org_id, graph)
+
+    terminal = await engine.run_once(run_id=run_id, org_id=org_id)
+    assert terminal == "escalated"
