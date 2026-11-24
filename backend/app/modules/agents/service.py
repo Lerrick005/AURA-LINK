@@ -1,4 +1,4 @@
-"""Agent lifecycle service.
+﻿"""Agent lifecycle service.
 
 Every function takes an AsyncSession bound to a tenant via tenant_session().
 Callers control the transaction boundary. The service never commits.
@@ -320,4 +320,10 @@ async def start_run(
     return run_id
 
 
-__all__.append("start_run")
+globals().setdefault('__all__', []).append('start_run')
+
+
+__all__ = [
+    "start_run",
+]
+
