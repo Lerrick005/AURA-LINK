@@ -79,7 +79,7 @@ async def seed_fixture():
                 "out": '{"type":"object"}',
             })
     async with tenant_session(ORG_ID) as s:
-        agent = await create_agent(s, org_id=ORG_ID, name=f"e2e-{uuid7str()[:8]}")
+        agent = await create_agent(s, org_id=ORG_ID, name=f"e2e-{__import__('uuid').uuid4().hex[:12]}")
         agent_id = agent.id
         config = AgentConfig(
             instructions="Call the echo tool to complete the task.",
@@ -169,4 +169,5 @@ def _report(fails) -> int:
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
+
 
