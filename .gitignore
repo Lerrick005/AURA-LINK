@@ -27,3 +27,9 @@ Thumbs.db
 *.log
 backend/_patch_backup_*/
 _patch_backup_*/
+*.sqlite
+*.db
+*.pem
+*.key
+backend/_patch_*.ps1
+backend/_inspect_*.txt
