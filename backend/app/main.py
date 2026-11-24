@@ -1,4 +1,4 @@
-"""Auralink FastAPI application.
+﻿"""Auralink FastAPI application.
 
 Wires logging, request-ID middleware, CORS, and the v1 router.
 Call site for uvicorn:
@@ -21,6 +21,7 @@ from app.api.v1.health import router as health_router
 from app.core import logging as alog
 from app.core.config import get_settings
 from app.core.db import dispose_engine
+from app.modules.tools.echo import register_echo_tool
 
 
 @asynccontextmanager
@@ -30,6 +31,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log = alog.get_logger("app.startup")
     s = get_settings()
     log.info("app_started", extra={"env": s.APP_ENV, "version": s.APP_VERSION})
+    register_echo_tool()
+    log.info("tool_registry_initialized", extra={"tools": ["echo"]})
     try:
         yield
     finally:
@@ -66,7 +69,7 @@ def create_app() -> FastAPI:
     )
 
     @app.middleware("http")
-    async def request_context_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
+    async def request_context_middleware(request: Request, call_next):
         incoming = request.headers.get("x-request-id")
         request_id = incoming if _is_safe_id(incoming) else uuid.uuid4().hex
         trace_id = uuid.uuid4().hex

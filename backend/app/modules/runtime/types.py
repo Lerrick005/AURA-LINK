@@ -96,6 +96,11 @@ class RepeatedRejectionError(EngineError):
     """Too many consecutive tool proposals rejected by policy."""
 
 
+
+# Named constant: used by decision.py (escalate on repeated rejections)
+# and engine.py (rejection-cap helper). Single source of truth.
+ESCALATION_REASON_REJECTION_CAP = "tool_rejections_exceeded"
+
 TerminalReason = Literal[
     "completed",
     "failed",

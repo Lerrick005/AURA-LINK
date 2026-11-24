@@ -22,6 +22,7 @@ from app.modules.agents.schemas import AgentConfig
 from app.modules.runtime.types import (
     StepDecision,
     TerminalToolStatus,
+    ESCALATION_REASON_REJECTION_CAP,
 )
 
 
@@ -63,7 +64,7 @@ def decide_next_step(state: RunState) -> StepDecision:
         return StepDecision(
             kind="terminate",
             terminal_reason="escalated",
-            escalation_reason="tool_rejections_exceeded",
+            escalation_reason=ESCALATION_REASON_REJECTION_CAP,
         )
 
     # --- Precedence 3: terminal-tool obligation -------------------------
