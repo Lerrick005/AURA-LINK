@@ -24,6 +24,7 @@ from app.core.errors import AppError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.modules.auth.router import router as auth_router
 from app.modules.agents.routes import router as agents_router
+from app.modules.webhooks.routes import router as webhooks_router
 from app.modules.runs.routes import router as runs_router
 from app.modules.workflows.routes import router as workflows_router
 from app.core import logging as alog
@@ -172,6 +173,7 @@ def create_app() -> FastAPI:
     app.include_router(workflows_router, prefix=s.API_V1_PREFIX)
     app.include_router(runs_router, prefix=s.API_V1_PREFIX)
     app.include_router(agents_router, prefix=s.API_V1_PREFIX)
+    app.include_router(webhooks_router, prefix=s.API_V1_PREFIX)
     return app
 
 

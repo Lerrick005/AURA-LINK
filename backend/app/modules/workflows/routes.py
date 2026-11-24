@@ -13,7 +13,7 @@ from app.modules.workflows.api_schemas import (
     WorkflowVersionCreate,
     WorkflowVersionResponse,
 )
-from app.modules.workflows.engine_factory import build_workflow_engine
+from app.modules.workflows.runner import run_workflow_background
 from app.modules.workflows.service import (
     InvalidWorkflowGraph,
     WorkflowNotFound,
@@ -137,14 +137,5 @@ async def api_trigger_workflow(
         except WorkflowNotFound:
             raise HTTPException(status_code=404, detail="workflow_not_found_or_not_deployed")
 
-    async def _run_workflow() -> None:
-        import logging
-        log = logging.getLogger(__name__)
-        try:
-            engine = build_workflow_engine()
-            await engine.run_once(run_id=run_id, org_id=org_id)
-        except Exception:
-            log.exception("workflow_run_failed", extra={"run_id": run_id, "org_id": org_id})
-
-    background_tasks.add_task(_run_workflow)
+    background_tasks.add_task(run_workflow_background, run_id=run_id, org_id=org_id)
     return {"run_id": run_id, "status": "accepted"}
