@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+
+import jsonschema
 from typing import Any
 
 from sqlalchemy import text
@@ -28,9 +30,10 @@ from app.adapters.llm.base import LLMProvider
 from app.core.db import get_sessionmaker, tenant_session
 from app.core.ids import uuid7str
 from app.core.logging import get_logger
+from app.modules.agents.schemas import ResolvedTool
 from app.modules.agents.service import start_run
 from app.modules.runtime.engine import RuntimeEngine
-from app.modules.runtime.types import EngineConfig, TerminalReason
+from app.modules.runtime.types import EngineConfig, EngineError, TerminalReason
 from app.modules.workflows.decision import decide_next_node
 from app.modules.workflows.expression import ExpressionError, evaluate
 from app.modules.workflows.schemas import Node, NodeConfig, NodeType, WorkflowGraph
@@ -200,8 +203,13 @@ class WorkflowEngine(RuntimeEngine):
                         agent_version_id=loaded.agent_version_id,
                         node=node,
                     )
+                elif node.type.value == "tool":
+                    await self._step_tool(
+                        run_id=run_id, org_id=org_id, epoch=epoch,
+                        agent_version_id=loaded.agent_version_id,
+                        node=node,
+                    )
                 else:
-                    # Tool node: not yet supported in 3.1e.
                     raise WorkflowEngineError(
                         f"node type not yet supported: {node.type.value!r}"
                     )
@@ -419,6 +427,144 @@ class WorkflowEngine(RuntimeEngine):
                     "evaluations": evaluation_log,
                 },
                 node_id=node.id,
+            )
+
+    # --- Tool resolution + dispatch --------------------------------------
+
+    async def _resolve_tool_by_key(
+        self, *, s: AsyncSession, org_id: str, tool_key: str
+    ) -> ResolvedTool:
+        """Resolve a tool by its key, respecting org scope.
+
+        Mirrors RuntimeEngine._load_full_tool but queries by key instead of id
+        (workflow nodes store tool_key, not tool_id). Prefers org-scoped tools
+        over global (org_id IS NULL) when both share a key.
+        """
+        row = (await s.execute(
+            text(
+                "SELECT id, key, name, description, input_schema, output_schema, "
+                "       risk_class, approval_policy, timeout_ms, idempotency_mode "
+                "FROM tools "
+                "WHERE key = :k AND (org_id IS NULL OR org_id = :o) "
+                "ORDER BY CASE WHEN org_id = :o THEN 0 ELSE 1 END "
+                "LIMIT 1"
+            ),
+            {"k": tool_key, "o": org_id},
+        )).mappings().first()
+        if row is None:
+            raise WorkflowEngineError(
+                f"tool_key not found or not visible to org: {tool_key!r}"
+            )
+        return ResolvedTool(
+            id=row["id"],
+            key=row["key"],
+            name=row["name"],
+            description=row["description"] or "",
+            input_schema=row["input_schema"] or {},
+            output_schema=row["output_schema"] or {},
+            risk_class=row["risk_class"],
+            approval_policy=row["approval_policy"],
+            timeout_ms=int(row["timeout_ms"]),
+            idempotency_mode=row["idempotency_mode"],
+            grant_config={},
+        )
+
+    async def _step_tool(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        agent_version_id: str,
+        node,
+    ) -> None:
+        """Execute a tool node.
+
+        MVP scope:
+          - Arguments = the entire workflow input (jsonb on agent_runs.input).
+            Workflow authors transform inputs via upstream nodes; a per-node
+            args_map will arrive in a later stage.
+          - Does NOT write a tool_calls row. execution_steps is the audit
+            surface for workflow tool invocations. Cross-run tool analytics
+            via tool_calls is a Stage 3.5 concern (see ADR-007, TBD).
+          - Idempotency key is `wf:{run_id}:{node.id}` — stable across
+            crash-resume of the same workflow run, distinct across runs.
+        """
+        if not node.config or not node.config.tool_key:
+            raise WorkflowEngineError(
+                f"tool node {node.id!r} missing config.tool_key"
+            )
+        tool_key = node.config.tool_key
+
+        # Phase 1: resolve tool, validate arguments, fetch executor (in txn)
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+            run = (await s.execute(
+                text("SELECT input FROM agent_runs WHERE id = :i"),
+                {"i": run_id},
+            )).mappings().one()
+            arguments = run["input"] or {}
+
+            tool = await self._resolve_tool_by_key(
+                s=s, org_id=org_id, tool_key=tool_key,
+            )
+
+            try:
+                jsonschema.validate(instance=arguments, schema=tool.input_schema)
+            except jsonschema.ValidationError as exc:
+                raise WorkflowEngineError(
+                    f"tool {tool.key!r} argument validation failed: {exc.message}"
+                ) from exc
+
+            try:
+                executor = self._tool_registry.executor_for(tool.key)
+            except EngineError as exc:
+                raise WorkflowEngineError(
+                    f"tool {tool.key!r} not registered with an executor: {exc}"
+                ) from exc
+
+        # Phase 2: invoke executor (outside any transaction; executor manages its own I/O)
+        idempotency_key = f"wf:{run_id}:{node.id}"
+        try:
+            result = await executor(
+                tool=tool,
+                arguments=arguments,
+                idempotency_key=idempotency_key,
+                timeout_seconds=tool.timeout_ms / 1000.0,
+            )
+        except Exception as exc:
+            raise WorkflowEngineError(
+                f"tool {tool.key!r} executor raised: {exc}"
+            ) from exc
+
+        # Phase 3: persist step, raise on failure (loop turns it into escalate)
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+            await self._append_step(
+                s=s, org_id=org_id, run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="tool",
+                status="ok" if result.ok else "failed",
+                input_data={
+                    "node_id": node.id,
+                    "tool_key": tool.key,
+                    "arguments": arguments,
+                },
+                output_data={
+                    "node_id": node.id,
+                    "ok": result.ok,
+                    "result": result.output,
+                    "verified": result.verified,
+                    "error": (
+                        str(result.error) if result.error is not None else None
+                    ),
+                },
+                node_id=node.id,
+            )
+
+        if not result.ok:
+            raise WorkflowEngineError(
+                f"tool {tool.key!r} returned ok=False: {result.error}"
             )
 
     # --- State loader ----------------------------------------------------

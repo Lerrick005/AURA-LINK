@@ -14,7 +14,7 @@ from sqlalchemy import text
 from app.core.db import tenant_session
 from app.core.ids import uuid7str
 from app.modules.runtime.engine import RuntimeEngine
-from app.modules.runtime.types import EngineConfig
+from app.modules.runtime.types import EngineConfig, EngineError, ToolResult
 from app.modules.workflows.engine import WorkflowEngine
 from app.modules.workflows.schemas import Branch, Node, NodeConfig, NodeType, WorkflowGraph
 from app.modules.workflows.service import create_workflow, create_version as create_wf_version, deploy_version
@@ -280,3 +280,127 @@ async def test_workflow_condition_no_match_escalates(world, engine):
 
     terminal = await engine.run_once(run_id=run_id, org_id=org_id)
     assert terminal == "escalated"
+
+
+class _MockExecutor:
+    """A registered executor that echoes the arguments back."""
+    def __init__(self, ok: bool = True):
+        self._ok = ok
+
+    async def __call__(self, *, tool, arguments, idempotency_key, timeout_seconds):
+        if self._ok:
+            return ToolResult(ok=True, output={"echoed": arguments}, verified=True)
+        return ToolResult(ok=False, output={}, error=RuntimeError("boom"))
+
+
+class _MockToolRegistry:
+    """Minimal in-test registry: only 'echo' resolves."""
+    def __init__(self, ok: bool = True):
+        self._executor = _MockExecutor(ok=ok)
+
+    def executor_for(self, tool_key: str):
+        if tool_key == "echo":
+            return self._executor
+        raise EngineError(f"unknown tool: {tool_key}")
+
+    def post_check_for(self, tool_key: str):
+        return None
+
+
+def _build_engine_with_registry(registry) -> WorkflowEngine:
+    config = EngineConfig(lease_ttl_seconds=30, heartbeat_interval_seconds=5)
+    agent_engine = RuntimeEngine(
+        session_factory=AsyncMock(), llm=Mock(), config=config,
+        tool_registry=AsyncMock(),
+    )
+    return WorkflowEngine(
+        session_factory=AsyncMock(), llm=Mock(), config=config,
+        tool_registry=registry, agent_engine=agent_engine,
+    )
+
+
+async def _seed_echo_tool(org_id: str) -> str:
+    tool_id = uuid7str()
+    async with tenant_session(org_id) as s:
+        await s.execute(
+            text(
+                "INSERT INTO tools "
+                "(id, org_id, key, name, description, input_schema, output_schema, "
+                " risk_class, approval_policy, timeout_ms, idempotency_mode) "
+                "VALUES (:id, :o, 'echo', 'Echo', 'Echo test tool', "
+                "        CAST(:is AS jsonb), CAST(:os AS jsonb), "
+                "        'read_only', 'auto', 5000, 'keyed')"
+            ),
+            {
+                "id": tool_id, "o": org_id,
+                "is": json.dumps({"type": "object"}),
+                "os": json.dumps({"type": "object"}),
+            },
+        )
+    return tool_id
+
+
+@pytest.mark.asyncio
+async def test_workflow_tool_node_success(world):
+    """Trigger -> tool(echo) -> terminate. Proves tool dispatch + persistence."""
+    org_id = world.a.org_id
+    await _seed_echo_tool(org_id)
+
+    graph = WorkflowGraph(
+        entry_node_id="start",
+        nodes=[
+            Node(id="start", type=NodeType.TRIGGER, next="do_tool"),
+            Node(id="do_tool", type=NodeType.TOOL, next="end",
+                 config=NodeConfig(tool_key="echo")),
+            Node(id="end", type=NodeType.TERMINATE, config=NodeConfig(reason="completed")),
+        ],
+    )
+    run_id, _ = await _setup_workflow_run(org_id, graph)
+
+    engine = _build_engine_with_registry(_MockToolRegistry(ok=True))
+    terminal = await engine.run_once(run_id=run_id, org_id=org_id)
+    assert terminal == TERMINAL_COMPLETED
+
+    async with tenant_session(org_id) as s:
+        steps = (await s.execute(
+            text("SELECT type, node_id, status, output FROM execution_steps "
+                 "WHERE execution_id = :id ORDER BY seq"),
+            {"id": run_id},
+        )).all()
+        assert len(steps) == 3
+        assert steps[1].type == "tool"
+        assert steps[1].node_id == "do_tool"
+        assert steps[1].status == "ok"
+        assert steps[1].output["ok"] is True
+        assert "echoed" in steps[1].output["result"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_tool_node_failure_escalates(world):
+    """Tool returns ok=False -> workflow escalates."""
+    org_id = world.a.org_id
+    await _seed_echo_tool(org_id)
+
+    graph = WorkflowGraph(
+        entry_node_id="start",
+        nodes=[
+            Node(id="start", type=NodeType.TRIGGER, next="do_tool"),
+            Node(id="do_tool", type=NodeType.TOOL, next="end",
+                 config=NodeConfig(tool_key="echo")),
+            Node(id="end", type=NodeType.TERMINATE, config=NodeConfig(reason="completed")),
+        ],
+    )
+    run_id, _ = await _setup_workflow_run(org_id, graph)
+
+    engine = _build_engine_with_registry(_MockToolRegistry(ok=False))
+    terminal = await engine.run_once(run_id=run_id, org_id=org_id)
+    assert terminal == TERMINAL_ESCALATED
+
+    async with tenant_session(org_id) as s:
+        steps = (await s.execute(
+            text("SELECT type, status FROM execution_steps "
+                 "WHERE execution_id = :id ORDER BY seq"),
+            {"id": run_id},
+        )).all()
+        # trigger, tool(failed), terminated(escalate)
+        assert any(st.type == "tool" and st.status == "failed" for st in steps)
