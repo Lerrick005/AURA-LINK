@@ -1047,24 +1047,36 @@ class RuntimeEngine:
                 )
             ).mappings().first()
             if tool_row is None:
-                # Not granted: reject, increment consecutive_rejections
-                await self._append_step(
-                    s=s,
-                    org_id=org_id,
-                    run_id=run_id,
+                await self._reject_proposal(
+                    s=s, org_id=org_id, run_id=run_id,
                     agent_version_id=agent_version_id,
-                    step_type="tool_rejected",
-                    status="ok",
-                    input_data={"tool": tool_key, "reason": "not_granted"},
+                    tool_key=tool_key, tool_call_id=proposal["id"],
+                    reason="not_granted", trace_extra={},
+                    role_tool_message="Tool not available.",
                 )
-                await s.execute(
-                    text(
-                        "UPDATE run_context "
-                        "SET consecutive_rejections = consecutive_rejections + 1, "
-                        "    updated_at = now() "
-                        "WHERE execution_id = :e"
+                return
+            try:
+                jsonschema.validate(
+                    instance=proposal["arguments"], schema=tool_row["input_schema"]
+                )
+            except jsonschema.ValidationError as exc:
+                vpath = "/".join(str(p) for p in exc.absolute_path) or "<root>"
+                await self._reject_proposal(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    tool_key=tool_key, tool_call_id=proposal["id"],
+                    reason="invalid_arguments",
+                    trace_extra={"validator": exc.validator, "path": vpath},
+                    role_tool_message=(
+                        f"Invalid arguments for {tool_key}: "
+                        f"'{exc.validator}' failed at {vpath}."
                     ),
-                    {"e": run_id},
+                )
+                return
+            except Exception:
+                await self._escalate_misconfigured(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id, tool_key=tool_key,
                 )
                 return
             # Compute idempotency key if mode=keyed
@@ -1254,13 +1266,13 @@ class RuntimeEngine:
         config: AgentConfig,
     ) -> None:
         """Execute one approved proposal. Writes tool_executing then tool_result."""
-        # Phase 1: read the proposal + persist intent
+        # Phase 1: read the proposal, persist intent (or detect a prior attempt)
         async with tenant_session(org_id) as s:
             await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
             last_proposed = (
                 await s.execute(
                     text(
-                        "SELECT seq, input, output FROM execution_steps "
+                        "SELECT id, seq, input FROM execution_steps "
                         "WHERE execution_id = :e AND type = 'tool_proposed' "
                         "ORDER BY seq DESC LIMIT 1"
                     ),
@@ -1270,50 +1282,65 @@ class RuntimeEngine:
             if last_proposed is None:
                 raise EngineError("no tool_proposed step to execute")
             proposed_input = last_proposed["input"]
-            # Check if a tool_executing step already exists for this
-            # proposal (recovery case).
-            already = (
+            proposal_step_id = str(last_proposed["id"])
+            tool = await self._load_full_tool(
+                s=s, tool_id=proposed_input["tool_id"]
+            )
+
+            prior = (
                 await s.execute(
                     text(
-                        "SELECT id, status FROM tool_calls "
-                        "WHERE execution_id = :e AND step_id = "
-                        "(SELECT id FROM execution_steps WHERE execution_id = :e "
-                        " AND seq = :sq)"
+                        "SELECT id, status, idempotency_mode_snapshot "
+                        "FROM tool_calls "
+                        "WHERE execution_id = :e AND step_id = :sid"
                     ),
-                    {"e": run_id, "sq": int(last_proposed["seq"])},
+                    {"e": run_id, "sid": proposal_step_id},
                 )
-            ).first()
-            call_id = None
-            if already is not None:
-                call_id = already[0]
-            else:
+            ).mappings().first()
+
+            if prior is None:
                 await self._append_step(
-                    s=s,
-                    org_id=org_id,
-                    run_id=run_id,
+                    s=s, org_id=org_id, run_id=run_id,
                     agent_version_id=agent_version_id,
-                    step_type="tool_executing",
-                    status="executing",
+                    step_type="tool_executing", status="executing",
                     input_data={"tool": proposed_input["tool"]},
                 )
-                # The _persist_tool_call helper writes the tool_calls row
-                # with a status of 'executing'.
-                tool = await self._load_full_tool(s=s, tool_id=proposed_input["tool_id"])
                 call_id = await self._persist_tool_call(
-                    s=s,
-                    org_id=org_id,
-                    run_id=run_id,
-                    step_id="",  # The step_id FK isn't required to be set for MVP
+                    s=s, org_id=org_id, run_id=run_id,
+                    step_id=proposal_step_id,
                     agent_version_id=agent_version_id,
                     tool=tool,
                     arguments=proposed_input["arguments"],
                     idempotency_key=proposed_input.get("idempotency_key"),
                     status="executing",
                 )
+            elif prior["status"] == "stuck":
+                return
+            elif prior["status"] in ("completed", "failed"):
+                raise EngineError("tool_call finalized without tool_result step")
+            elif prior["idempotency_mode_snapshot"] == "keyed":
+                call_id = str(prior["id"])
+            else:
+                esc_id = await self._escalate_indeterminate(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    stuck_call_id=str(prior["id"]),
+                )
+                await self._write_terminated(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="escalated",
+                    detail={
+                        "reason": "indeterminate_side_effect",
+                        "escalation_id": esc_id,
+                    },
+                )
+                return
         # Phase 2: execute tool with timeout, NO tx held
         executor = self._tool_registry.executor_for(tool.key)
         # SECURITY FIX: Timeout enforced from tool config, not LLM proposal.
         timeout_s = float(tool.timeout_ms) / 1000.0 if tool.timeout_ms else 15.0
+        timed_out = False
         try:
             result = await asyncio.wait_for(
                 executor(
@@ -1325,6 +1352,7 @@ class RuntimeEngine:
                 timeout=timeout_s + 5.0,
             )
         except asyncio.TimeoutError:
+            timed_out = True
             result = ToolResult(ok=False, error=TimeoutError("tool timeout"))
         except Exception as exc:
             result = ToolResult(ok=False, error=exc)
@@ -1344,6 +1372,20 @@ class RuntimeEngine:
         # Phase 4: persist result in a short tx
         async with tenant_session(org_id) as s:
             await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+            if timed_out and tool.idempotency_mode != "keyed":
+                esc_id = await self._escalate_indeterminate(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    stuck_call_id=str(call_id),
+                )
+                await self._write_terminated(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="escalated",
+                    detail={"reason": "indeterminate_side_effect",
+                            "escalation_id": esc_id},
+                )
+                return
             call_status = "completed" if result.ok else "failed"
             await s.execute(
                 text(
