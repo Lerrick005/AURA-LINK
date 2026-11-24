@@ -23,6 +23,7 @@ from app.core.db import tenant_session
 from app.core.ids import uuid7str
 from app.core.logging import get_logger
 from app.modules.runtime.registry import get_tool_registry
+from app.modules.runtime.messages import trim_messages
 from app.modules.runtime.types import TerminalToolStatus
 from app.modules.runtime.decision import RunState, decide_next_step
 from dataclasses import dataclass
@@ -217,20 +218,20 @@ class RuntimeEngine:
         ).mappings().one()
         now = _now()
         elapsed = (now - row["started_at"]).total_seconds()
-        if elapsed > config.limits.max_seconds:
+        if elapsed >= config.limits.max_seconds:
             await self._write_terminated(
                 s=s, org_id=org_id, run_id=run_id, agent_version_id=agent_version_id,
                 reason="timed_out", detail={"elapsed_seconds": round(elapsed, 2)},
             )
             return "timed_out"
-        if row["iteration_count"] > config.limits.max_steps:
+        if row["iteration_count"] >= config.limits.max_steps:
             await self._write_terminated(
                 s=s, org_id=org_id, run_id=run_id, agent_version_id=agent_version_id,
                 reason="budget_exceeded",
                 detail={"limit": "max_steps", "value": config.limits.max_steps},
             )
             return "budget_exceeded"
-        if row["tool_call_count"] > config.limits.max_tool_calls:
+        if row["tool_call_count"] >= config.limits.max_tool_calls:
             await self._write_terminated(
                 s=s, org_id=org_id, run_id=run_id, agent_version_id=agent_version_id,
                 reason="budget_exceeded",
@@ -238,7 +239,7 @@ class RuntimeEngine:
             )
             return "budget_exceeded"
         cost = Decimal(str(row["cost_usd"]))
-        if cost > config.limits.max_cost_usd:
+        if cost >= config.limits.max_cost_usd:
             await self._write_terminated(
                 s=s, org_id=org_id, run_id=run_id, agent_version_id=agent_version_id,
                 reason="budget_exceeded",
@@ -987,7 +988,7 @@ class RuntimeEngine:
                     "WHERE execution_id = :e"
                 ),
                 {
-                    "m": _jsonb(new_messages),
+                    "m": _jsonb(trim_messages(new_messages)),
                     "sc": _jsonb(scratch),
                     "e": run_id,
                 },
@@ -1172,14 +1173,21 @@ class RuntimeEngine:
                 "name": tool_key,
                 "content": role_tool_message,
             }
+            # Load, append, trim, rewrite. Same pattern as the other two
+            # messages write sites so the trim cap always applies.
+            current = (await s.execute(
+                text("SELECT messages FROM run_context WHERE execution_id = :e FOR UPDATE"),
+                {"e": run_id},
+            )).scalar_one()
+            new_list = trim_messages(list(current or []) + [msg])
             await s.execute(
                 text(
                     "UPDATE run_context "
-                    "SET messages = messages || CAST(:m AS jsonb), "
+                    "SET messages = CAST(:m AS jsonb), "
                     "    updated_at = now() "
                     "WHERE execution_id = :e"
                 ),
-                {"m": _jsonb([msg]), "e": run_id},
+                {"m": _jsonb(new_list), "e": run_id},
             )
     async def _escalate_misconfigured(
         self,
@@ -1472,7 +1480,7 @@ class RuntimeEngine:
                         "UPDATE run_context SET messages = CAST(:m AS jsonb), "
                         "updated_at = now() WHERE execution_id = :e"
                     ),
-                    {"m": _jsonb(messages), "e": run_id},
+                    {"m": _jsonb(trim_messages(messages)), "e": run_id},
                 )
             # Post-check exception escalation for external/irreversible
             if post_check_exc is not None and tool.risk_class in (
@@ -1584,3 +1592,5 @@ def _error_dict(exc: BaseException | None) -> dict[str, Any]:
         "error_type": type(exc).__name__,
         "message": str(exc),
     }
+
+

@@ -80,3 +80,34 @@ async def test_tenant_session_requires_org_id():
     with pytest.raises(ValueError):
         async with tenant_session(""):
             pass
+
+
+async def test_uuid_object_and_string_are_equivalent(world):
+    """tenant_session must treat uuid.UUID and str identically.
+
+    Guards against RLS comparison footgun: app.org_id GUC is text, org_id
+    columns are VARCHAR(36). If uuid7str() format and str(uuid.UUID(...))
+    format differ, one form silently returns 0 rows via RLS while the other
+    works. This test locks in equivalence.
+    """
+    import uuid
+    org_str = world.a.org_id
+    org_uuid = uuid.UUID(org_str)
+    async with tenant_session(org_str) as s:
+        by_str = (await s.execute(
+            text("SELECT count(*) FROM agents WHERE org_id = :o"), {"o": org_str}
+        )).scalar_one()
+    async with tenant_session(org_uuid) as s:
+        by_uuid = (await s.execute(
+            text("SELECT count(*) FROM agents WHERE org_id = :o"), {"o": str(org_uuid)}
+        )).scalar_one()
+    async with tenant_session(org_uuid) as s:
+        # Also assert the raw count using the GUC value the session set
+        via_guc = (await s.execute(
+            text("SELECT count(*) FROM agents WHERE org_id = current_setting('app.org_id', true)")
+        )).scalar_one()
+    assert by_str == by_uuid == via_guc, (
+        f"RLS mismatch: str={by_str}, uuid={by_uuid}, guc={via_guc}. "
+        f"Check app/core/ids.py uuid7str() format vs str(uuid.UUID(...))."
+    )
+    assert by_str > 0, "fixture should have at least one agent"

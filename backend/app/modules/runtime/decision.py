@@ -50,13 +50,13 @@ def decide_next_step(state: RunState) -> StepDecision:
     """Pure: state in, decision out. No side effects."""
 
     # --- Precedence 1: budget and time beat everything else -------------
-    if state.elapsed_seconds > state.config.limits.max_seconds:
+    if state.elapsed_seconds >= state.config.limits.max_seconds:
         return StepDecision(kind="terminate", terminal_reason="timed_out")
-    if state.iteration_count > state.config.limits.max_steps:
+    if state.iteration_count >= state.config.limits.max_steps:
         return StepDecision(kind="terminate", terminal_reason="budget_exceeded")
-    if state.tool_call_count > state.config.limits.max_tool_calls:
+    if state.tool_call_count >= state.config.limits.max_tool_calls:
         return StepDecision(kind="terminate", terminal_reason="budget_exceeded")
-    if state.cost_usd > float(state.config.limits.max_cost_usd):
+    if state.cost_usd >= float(state.config.limits.max_cost_usd):
         return StepDecision(kind="terminate", terminal_reason="budget_exceeded")
 
     # --- Precedence 2: repeated rejections ------------------------------

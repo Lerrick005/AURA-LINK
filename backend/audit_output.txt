@@ -1,0 +1,3405 @@
+﻿
+
+===== 0. CONTEXT =====
+
+
+--- pwd ---
+
+
+Path                                   
+----                                   
+C:\Users\Administrator\AURALINK\backend
+
+
+
+--- python ---
+
+Python 3.12.10
+
+
+===== 1. GIT FILES =====
+
+
+--- git ls-files ---
+
+.env.example
+_smoke_escalation.py
+alembic.ini
+app/__init__.py
+app/adapters/__init__.py
+app/adapters/llm/__init__.py
+app/adapters/llm/base.py
+app/adapters/llm/openai_compat.py
+app/api/__init__.py
+app/api/deps.py
+app/api/v1/__init__.py
+app/api/v1/health.py
+app/core/__init__.py
+app/core/config.py
+app/core/db.py
+app/core/ids.py
+app/core/logging.py
+app/core/redaction.py
+app/main.py
+app/modules/__init__.py
+app/modules/agents/__init__.py
+app/modules/agents/models.py
+app/modules/agents/schemas.py
+app/modules/agents/service.py
+app/modules/runtime/__init__.py
+app/modules/runtime/decision.py
+app/modules/runtime/engine.py
+app/modules/runtime/registry.py
+app/modules/runtime/types.py
+app/modules/tools/__init__.py
+app/modules/tools/echo.py
+app/py.typed
+migrations/env.py
+migrations/script.py.mako
+migrations/versions/0001_initial.py
+migrations/versions/0002_runtime.py
+migrations/versions/0003_run_context.py
+migrations/versions/0004_run_context_messages.py
+pyproject.toml
+requirements.txt
+run.py
+smoke_engine.py
+tests/conftest.py
+tests/db/conftest.py
+tests/db/test_tenant_isolation.py
+tests/unit/test_engine_static_guards.py
+tests/unit/test_registry_and_echo.py
+tests/unit/test_runtime_types.py
+
+
+===== 2. GIT STATUS =====
+
+
+--- status ---
+
+?? audit.ps1
+?? audit_output.txt
+
+
+===== 3. ALEMBIC =====
+
+
+--- current ---
+
+alembic : INFO  
+[alembic.runtime.migration] Context impl 
+PostgresqlImpl.
+At C:\Users\Administrator\AURALINK\backen
+d\audit.ps1:10 char:50
++ ... tion "3. ALEMBIC";            Cmd 
+"current" { alembic current }; Cmd  ...
++                                        
+           ~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecifi 
+   ed: (INFO  [alembic....PostgresqlImp  
+  l.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeComm 
+   andError
+ 
+INFO  [alembic.runtime.migration] Will 
+assume transactional DDL.
+0004_run_context_messages (head)
+
+--- history ---
+
+0003_run_context -> 0004_run_context_messages (head), run_context.messages: accumulated LLM conversation
+0002_runtime -> 0003_run_context, run_context table and tool_calls.status CHECK
+0001_initial -> 0002_runtime, runtime schema: execution_steps, tool_calls, escalations; lease columns on agent_runs
+<base> -> 0001_initial, initial schema: agents, versions, tools, grants, runs + RLS + builtin seed
+
+
+===== 4. TESTS RUN =====
+
+
+--- pytest ---
+
+..............................                                           [100%]
+30 passed in 6.65s
+
+
+===== 5. TENANT TEST =====
+
+
+--- file ---
+
+import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+
+from app.core.db import get_sessionmaker, tenant_session
+
+
+@pytest.mark.parametrize(
+    "table,attr",
+    [("agents", "agent_id"), ("agent_versions", "version_id"),
+     ("agent_runs", "run_id"), ("tool_calls", "call_id")],
+)
+async def test_tenant_sees_only_its_own_rows(world, table, attr):
+    row_id = getattr(world.a, attr)
+    q = text(f"SELECT count(*) FROM {table} WHERE id = :i")
+    async with tenant_session(world.a.org_id) as s:
+        assert (await s.execute(q, {"i": row_id})).scalar_one() == 1
+    async with tenant_session(world.b.org_id) as s:
+        assert (await s.execute(q, {"i": row_id})).scalar_one() == 0
+
+
+async def test_other_tenant_cannot_update_tool_call(world):
+    async with tenant_session(world.b.org_id) as s:
+        res = await s.execute(
+            text("UPDATE tool_calls SET status = 'failed' WHERE id = :i"),
+            {"i": world.a.call_id},
+        )
+        assert res.rowcount == 0
+    async with tenant_session(world.a.org_id) as s:
+        status = (await s.execute(
+            text("SELECT status FROM tool_calls WHERE id = :i"), {"i": world.a.call_id},
+        )).scalar_one()
+    assert status == "executing"
+
+
+async def test_insert_into_another_orgs_rows_is_rejected(world, insert_tool_call):
+    with pytest.raises(DBAPIError, match="row-level security"):
+        async with tenant_session(world.b.org_id) as s:
+            await insert_tool_call(
+                s, org_id=world.a.org_id, run_id=world.a.run_id,
+                version_id=world.a.version_id, tool_id=world.a.tool_id,
+            )
+
+
+async def test_illegal_tool_call_status_rejected_by_db(world):
+    with pytest.raises(DBAPIError, match="ck_tool_calls_status"):
+        async with tenant_session(world.a.org_id) as s:
+            await s.execute(
+                text("UPDATE tool_calls SET status = 'bogus' WHERE id = :i"),
+                {"i": world.a.call_id},
+            )
+
+
+async def test_duplicate_idempotency_key_rejected(world, insert_tool_call):
+    async with tenant_session(world.a.org_id) as s:
+        key = (await s.execute(
+            text("SELECT idempotency_key FROM tool_calls WHERE id = :i"), {"i": world.a.call_id},
+        )).scalar_one()
+    with pytest.raises(DBAPIError, match="uq_tool_calls_idempotency"):
+        async with tenant_session(world.a.org_id) as s:
+            await insert_tool_call(
+                s, org_id=world.a.org_id, run_id=world.a.run_id,
+                version_id=world.a.version_id, tool_id=world.a.tool_id, idem=key,
+            )
+
+
+async def test_runtime_role_cannot_delete_tool_calls(world):
+    with pytest.raises(DBAPIError, match="permission denied"):
+        async with tenant_session(world.a.org_id) as s:
+            await s.execute(text("DELETE FROM tool_calls WHERE id = :i"), {"i": world.a.call_id})
+
+
+async def test_no_tenant_context_sees_nothing(world):
+    async with get_sessionmaker()() as s:
+        n = (await s.execute(text("SELECT count(*) FROM agent_runs"))).scalar_one()
+    assert n == 0
+
+
+async def test_tenant_session_requires_org_id():
+    with pytest.raises(ValueError):
+        async with tenant_session(""):
+            pass
+
+
+
+===== 6. DB CONFTEST =====
+
+
+--- file ---
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import pytest_asyncio
+from sqlalchemy import text
+
+from app.core.db import dispose_engine, tenant_session
+from app.core.ids import uuid7str
+from app.modules.agents.models import Agent, AgentRun, AgentVersion
+
+BACKEND = Path(__file__).resolve().parents[2]
+
+_INSERT_TOOL_CALL = text(
+    "INSERT INTO tool_calls (id, org_id, execution_id, step_id, agent_version_id, tool_id, "
+    " tool_key_snapshot, risk_class_snapshot, idempotency_mode_snapshot, input, "
+    " input_redacted, status, idempotency_key) "
+    "VALUES (:id, :o, :e, NULL, :v, :t, 'echo', 'read_only', 'keyed', '{}'::jsonb, true, :st, :ik)"
+)
+
+
+@pytest.fixture(scope="session")
+def migrated_db():
+    r = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=BACKEND, env=dict(os.environ), capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        pytest.exit(f"alembic upgrade failed on the TEST database:\n{r.stdout}\n{r.stderr}", returncode=2)
+
+
+@pytest.fixture
+def insert_tool_call():
+    async def _insert(s, *, org_id, run_id, version_id, tool_id, status="executing", idem=None):
+        call_id = uuid7str()
+        await s.execute(
+            _INSERT_TOOL_CALL,
+            {"id": call_id, "o": org_id, "e": run_id, "v": version_id,
+             "t": tool_id, "st": status, "ik": idem or f"k-{call_id}"},
+        )
+        return call_id
+    return _insert
+
+
+@pytest_asyncio.fixture
+async def world(migrated_db, insert_tool_call):
+    """Two orgs, each with agent, version, run and one tool_call."""
+    made = {}
+    for name in ("a", "b"):
+        org_id = uuid7str()
+        async with tenant_session(org_id) as s:
+            agent = Agent(org_id=org_id, name=f"agent-{org_id[:8]}")
+            s.add(agent)
+            await s.flush()
+            ver = AgentVersion(
+                agent_id=agent.id, org_id=org_id, version=1,
+                config={"instructions": "x", "model": "gpt-4o-mini"},
+            )
+            s.add(ver)
+            await s.flush()
+            run = AgentRun(org_id=org_id, agent_version_id=ver.id)
+            s.add(run)
+            await s.flush()
+            tool_id = (await s.execute(text("SELECT id FROM tools ORDER BY key LIMIT 1"))).scalar_one_or_none()
+            if tool_id is None:
+                pytest.skip("no builtin tool visible to tenants; seed migration did not run?")
+            call_id = await insert_tool_call(
+                s, org_id=org_id, run_id=run.id, version_id=ver.id, tool_id=tool_id,
+            )
+        made[name] = SimpleNamespace(
+            org_id=org_id, agent_id=agent.id, version_id=ver.id,
+            run_id=run.id, tool_id=tool_id, call_id=call_id,
+        )
+    yield SimpleNamespace(**made)
+    await dispose_engine()
+
+
+
+===== 7. MIG 0001 =====
+
+
+--- file ---
+
+"""initial schema: agents, versions, tools, grants, runs + RLS + builtin seed
+
+Revision ID: 0001_initial
+Revises:
+Create Date: 2026-11-23
+
+Design notes:
+- All primary keys are VARCHAR(36) UUIDv7 strings (app-generated).
+- Every table with org_id gets ENABLE + FORCE ROW LEVEL SECURITY and a policy
+  using current_setting('app.org_id', true). FORCE is required because
+  the owner role would otherwise bypass RLS.
+- tools.org_id is nullable for builtins. Policy allows NULL rows for everyone
+  (builtin visibility) plus rows matching the current org (per-tenant custom).
+- auralink_app gets SELECT/INSERT/UPDATE/DELETE on each table but never DDL.
+- Three builtin tools are seeded with org_id NULL.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+revision: str = "0001_initial"
+down_revision: str | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+JSONB = postgresql.JSONB(astext_type=sa.Text())
+
+
+_TENANT_TABLES = (
+    "agents",
+    "agent_versions",
+    "agent_tool_grants",
+    "agent_runs",
+)
+
+
+def _enable_rls(table: str) -> None:
+    """ENABLE + FORCE RLS, and create the tenant_isolation policy."""
+    op.execute(sa.text(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"))
+    op.execute(sa.text(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY"))
+    op.execute(
+        sa.text(
+            f"CREATE POLICY tenant_isolation ON {table} "
+            f"USING (org_id = current_setting('app.org_id', true))"
+        )
+    )
+
+
+def _grant_to_app(table: str) -> None:
+    op.execute(
+        sa.text(
+            f"GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO auralink_app"
+        )
+    )
+
+
+def upgrade() -> None:
+    # --- agents ---------------------------------------------------------
+    op.create_table(
+        "agents",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("org_id", sa.String(36), nullable=False),
+        sa.Column("name", sa.String(200), nullable=False),
+        sa.Column("status", sa.String(32), nullable=False, server_default="draft"),
+        sa.Column("current_version_id", sa.String(36), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.UniqueConstraint("org_id", "name", name="uq_agents_org_name"),
+    )
+    op.create_index("ix_agents_org_id", "agents", ["org_id"])
+    op.create_index("ix_agents_org_status", "agents", ["org_id", "status"])
+
+    # --- agent_versions -------------------------------------------------
+    op.create_table(
+        "agent_versions",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("agent_id", sa.String(36), sa.ForeignKey("agents.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("org_id", sa.String(36), nullable=False),
+        sa.Column("version", sa.Integer, nullable=False),
+        sa.Column("config", JSONB, nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("created_by", sa.String(36), nullable=True),
+        sa.UniqueConstraint("agent_id", "version", name="uq_agent_versions_agent_version"),
+    )
+    op.create_index("ix_agent_versions_agent_id", "agent_versions", ["agent_id"])
+    op.create_index("ix_agent_versions_org_id", "agent_versions", ["org_id"])
+    op.create_index("ix_agent_versions_org_agent", "agent_versions", ["org_id", "agent_id"])
+
+    # --- tools ----------------------------------------------------------
+    op.create_table(
+        "tools",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("org_id", sa.String(36), nullable=True),
+        sa.Column("key", sa.String(100), nullable=False),
+        sa.Column("name", sa.String(200), nullable=False),
+        sa.Column("description", sa.Text, nullable=False),
+        sa.Column("input_schema", JSONB, nullable=False),
+        sa.Column("output_schema", JSONB, nullable=False),
+        sa.Column("risk_class", sa.String(32), nullable=False),
+        sa.Column("approval_policy", sa.String(32), nullable=False, server_default="auto"),
+        sa.Column("timeout_ms", sa.Integer, nullable=False, server_default="15000"),
+        sa.Column("idempotency_mode", sa.String(32), nullable=False, server_default="keyed"),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.UniqueConstraint("org_id", "key", name="uq_tools_org_key"),
+    )
+    op.create_index("ix_tools_org_id", "tools", ["org_id"])
+    op.create_index("ix_tools_org_risk", "tools", ["org_id", "risk_class"])
+
+    # --- agent_tool_grants ---------------------------------------------
+    op.create_table(
+        "agent_tool_grants",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("agent_version_id", sa.String(36), sa.ForeignKey("agent_versions.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("tool_id", sa.String(36), sa.ForeignKey("tools.id", ondelete="RESTRICT"), nullable=False),
+        sa.Column("org_id", sa.String(36), nullable=False),
+        sa.Column("config", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
+        sa.UniqueConstraint("agent_version_id", "tool_id", name="uq_grants_version_tool"),
+    )
+    op.create_index("ix_grants_agent_version_id", "agent_tool_grants", ["agent_version_id"])
+    op.create_index("ix_grants_tool_id", "agent_tool_grants", ["tool_id"])
+    op.create_index("ix_grants_org_id", "agent_tool_grants", ["org_id"])
+
+    # --- agent_runs -----------------------------------------------------
+    op.create_table(
+        "agent_runs",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("org_id", sa.String(36), nullable=False),
+        sa.Column("agent_version_id", sa.String(36), sa.ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=False),
+        sa.Column("status", sa.String(32), nullable=False, server_default="pending"),
+        sa.Column("terminal_reason", sa.Text, nullable=True),
+        sa.Column("input", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
+        sa.Column("output", JSONB, nullable=True),
+        sa.Column("started_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("iteration_count", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("tool_call_count", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("tokens_in", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("tokens_out", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("cost_usd", sa.Numeric(12, 6), nullable=False, server_default="0"),
+    )
+    op.create_index("ix_agent_runs_org_id", "agent_runs", ["org_id"])
+    op.create_index("ix_agent_runs_agent_version_id", "agent_runs", ["agent_version_id"])
+    op.create_index("ix_agent_runs_org_status", "agent_runs", ["org_id", "status"])
+    op.create_index("ix_agent_runs_org_started", "agent_runs", ["org_id", "started_at"])
+
+    # --- RLS on tenant tables ------------------------------------------
+    for table in _TENANT_TABLES:
+        _enable_rls(table)
+
+    # tools: nullable org_id for builtins. Custom tools per-tenant; builtins visible to all.
+    op.execute(sa.text("ALTER TABLE tools ENABLE ROW LEVEL SECURITY"))
+    op.execute(sa.text("ALTER TABLE tools FORCE ROW LEVEL SECURITY"))
+    op.execute(
+        sa.text(
+            "CREATE POLICY tenant_isolation ON tools "
+            "USING (org_id IS NULL OR org_id = current_setting('app.org_id', true))"
+        )
+    )
+
+    # --- Grants to runtime role ----------------------------------------
+    for table in ("agents", "agent_versions", "tools", "agent_tool_grants", "agent_runs"):
+        _grant_to_app(table)
+
+    # --- Seed builtin tools (org_id NULL) ------------------------------
+    # Use op.execute("...") with a raw string, NOT sa.text(...).
+    # sa.text() parses ":name" as a bind parameter, and JSON literals like
+    # {"minimum":1,"maximum":20} contain ":" followed by digits, which
+    # SQLAlchemy would misread as bind params named "1" / "2".
+    _BUILTIN_TOOLS = (
+        (
+            "00000000-0000-7000-8000-000000000001",
+            "knowledge.search",
+            "Knowledge search",
+            "Search the tenant knowledge base. Returns passages with citations.",
+            '{"type":"object","properties":{"query":{"type":"string"},"top_k":{"type":"integer","minimum":1,"maximum":20}},"required":["query"]}',
+            '{"type":"object","properties":{"passages":{"type":"array"}},"required":["passages"]}',
+            "read_only",
+            "auto",
+            10000,
+            "none",
+        ),
+        (
+            "00000000-0000-7000-8000-000000000002",
+            "channel.reply",
+            "Send channel reply",
+            "Send a message to the originating conversation on the active channel.",
+            '{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":4000}},"required":["text"]}',
+            '{"type":"object","properties":{"message_id":{"type":"string"},"delivered":{"type":"boolean"}},"required":["message_id","delivered"]}',
+            "external_communication",
+            "always",
+            15000,
+            "keyed",
+        ),
+        (
+            "00000000-0000-7000-8000-000000000003",
+            "handoff.request",
+            "Request human handoff",
+            "Escalate the conversation to a human operator with context and reasoning.",
+            '{"type":"object","properties":{"reason":{"type":"string"},"priority":{"type":"string","enum":["low","normal","high"]}},"required":["reason"]}',
+            '{"type":"object","properties":{"escalation_id":{"type":"string"}},"required":["escalation_id"]}',
+            "reversible_write",
+            "auto",
+            5000,
+            "keyed",
+        ),
+    )
+    for _id, _key, _name, _desc, _in, _out, _risk, _approval, _timeout, _idem in _BUILTIN_TOOLS:
+        _sql = (
+            "INSERT INTO tools "
+            "(id, org_id, key, name, description, input_schema, output_schema, "
+            " risk_class, approval_policy, timeout_ms, idempotency_mode) VALUES ("
+            f"'{_id}', NULL, '{_key}', '{_name}', '{_desc}', "
+            f"'{_in}'::jsonb, '{_out}'::jsonb, "
+            f"'{_risk}', '{_approval}', {_timeout}, '{_idem}'"
+            ")"
+        )
+        # exec_driver_sql bypasses SQLAlchemy text() parsing entirely.
+        # This is required for literal JSON: text() misreads '":1"' as a
+        # positional bind parameter and asyncpg rejects it.
+        op.get_bind().exec_driver_sql(_sql)
+
+def downgrade() -> None:
+    op.drop_table("agent_runs")
+    op.drop_table("agent_tool_grants")
+    op.drop_table("tools")
+    op.drop_table("agent_versions")
+    op.drop_table("agents")
+
+
+
+===== 8. ENGINE =====
+
+
+--- file ---
+
+"""Runtime engine: state machine for governed agent execution.
+Part A: infrastructure. Part B (next file section) adds run_once() and the
+step handlers. This file owns transaction boundaries, lease fencing, and
+the single write path for execution_steps and tool_calls.
+Fence rule: the first statement in every transactional block is
+  UPDATE agent_runs SET lease_heartbeat_at=now()
+   WHERE id=:run_id AND lease_epoch=:epoch
+If 0 rows, raise StaleLeaseError. No side effects applied.
+"""
+from __future__ import annotations
+import asyncio
+import json
+import jsonschema
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from app.adapters.llm.base import LLMProvider
+from app.core.db import tenant_session
+from app.core.ids import uuid7str
+from app.core.logging import get_logger
+from app.modules.runtime.registry import get_tool_registry
+from app.modules.runtime.types import TerminalToolStatus
+from app.modules.runtime.decision import RunState, decide_next_step
+from dataclasses import dataclass
+from app.core.redaction import redact
+from app.modules.agents.schemas import AgentConfig, ResolvedTool
+from app.modules.runtime.types import (
+    EngineConfig,
+    EngineError,
+    IndeterminateSideEffectError,
+    RunNotFound,
+    RunNotResumable,
+    StaleLeaseError,
+    TerminalReason,
+    ToolRegistry,
+    ToolResult,
+    compute_idempotency_key,
+)
+log = get_logger(__name__)
+TERMINAL_REASONS: frozenset[str] = frozenset(
+    {"completed", "failed", "escalated", "timed_out", "budget_exceeded", "cancelled"}
+)
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+def _jsonb(value: Any) -> str:
+    return json.dumps(value, default=str, separators=(",", ":"))
+class RuntimeEngine:
+    """Executes one agent run to a terminal state."""
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession],
+        llm: LLMProvider,
+        tool_registry: ToolRegistry,
+        config: EngineConfig,
+    ) -> None:
+        self._session_factory = session_factory
+        self._llm = llm
+        self._tool_registry = tool_registry or get_tool_registry()
+        self._config = config
+    # --- Leases ---------------------------------------------------------
+    async def _claim_lease(
+        self, *, run_id: str, org_id: str, holder: str
+    ) -> int:
+        """Claim or renew the lease. Returns the new epoch."""
+        async with tenant_session(org_id) as s:
+            row = (
+                await s.execute(
+                    text(
+                        "SELECT status, lease_holder, lease_expires_at, lease_epoch "
+                        "FROM agent_runs WHERE id = :i FOR UPDATE"
+                    ),
+                    {"i": run_id},
+                )
+            ).mappings().first()
+            if row is None:
+                raise RunNotFound(run_id)
+            if row["status"] in TERMINAL_REASONS:
+                raise RunNotResumable(
+                    "run " + run_id + " is terminal: " + str(row["status"])
+                )
+            now = _now()
+            held_by_other = (
+                row["lease_holder"] is not None
+                and row["lease_holder"] != holder
+                and row["lease_expires_at"] is not None
+                and row["lease_expires_at"] > now
+            )
+            if held_by_other:
+                raise StaleLeaseError(
+                    "run " + run_id + " leased to " + str(row["lease_holder"])
+                    + " until " + str(row["lease_expires_at"])
+                )
+            new_epoch = int(row["lease_epoch"]) + 1
+            await s.execute(
+                text(
+                    "UPDATE agent_runs "
+                    "SET lease_holder = :h, lease_epoch = :e, "
+                    "    lease_expires_at = now() + make_interval(secs => :ttl), "
+                    "    lease_heartbeat_at = now(), "
+                    "    status = CASE WHEN status = 'pending' THEN 'running' ELSE status END "
+                    "WHERE id = :i"
+                ),
+                {"h": holder, "e": new_epoch, "ttl": self._config.lease_ttl_seconds, "i": run_id},
+            )
+            return new_epoch
+    async def _fence_and_heartbeat(
+        self, *, s: AsyncSession, run_id: str, epoch: int
+    ) -> None:
+        """First statement of every transactional block. Raises on stale epoch."""
+        result = await s.execute(
+            text(
+                "UPDATE agent_runs "
+                "SET lease_heartbeat_at = now(), "
+                "    lease_expires_at = now() + make_interval(secs => :ttl) "
+                "WHERE id = :i AND lease_epoch = :e AND status = 'running' "
+                "RETURNING id"
+            ),
+            {"ttl": self._config.lease_ttl_seconds, "i": run_id, "e": epoch},
+        )
+        if result.first() is None:
+            raise StaleLeaseError(
+                "epoch " + str(epoch) + " no longer current for run " + run_id
+            )
+    async def _release_lease(
+        self, *, run_id: str, org_id: str, epoch: int
+    ) -> None:
+        async with tenant_session(org_id) as s:
+            await s.execute(
+                text(
+                    "UPDATE agent_runs SET lease_holder = NULL, lease_expires_at = NULL "
+                    "WHERE id = :i AND lease_epoch = :e"
+                ),
+                {"i": run_id, "e": epoch},
+            )
+    # --- Step writing (single path) ------------------------------------
+    async def _append_step(
+        self,
+        *,
+        s: AsyncSession,
+        org_id: str,
+        run_id: str,
+        agent_version_id: str,
+        step_type: str,
+        status: str,
+        input_data: dict[str, Any] | None = None,
+        output_data: dict[str, Any] | None = None,
+        model: str | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        cost_usd: Decimal | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> tuple[str, int]:
+        seq = int(
+            (
+                await s.execute(
+                    text(
+                        "SELECT COALESCE(MAX(seq), 0) + 1 "
+                        "FROM execution_steps WHERE execution_id = :e"
+                    ),
+                    {"e": run_id},
+                )
+            ).scalar_one()
+        )
+        step_id = uuid7str()
+        await s.execute(
+            text(
+                "INSERT INTO execution_steps "
+                "(id, org_id, execution_id, agent_version_id, seq, type, status, "
+                " input, output, model, tokens_in, tokens_out, cost_usd, finished_at, error) "
+                "VALUES "
+                "(:id, :o, :e, :v, :seq, :t, :st, "
+                " CAST(:inp AS jsonb), CAST(:out AS jsonb), :m, :ti, :to, :c, now(), "
+                " CAST(:err AS jsonb))"
+            ),
+            {
+                "id": step_id,
+                "o": org_id,
+                "e": run_id,
+                "v": agent_version_id,
+                "seq": seq,
+                "t": step_type,
+                "st": status,
+                "inp": _jsonb(redact(input_data or {})),
+                "out": _jsonb(redact(output_data or {})),
+                "m": model,
+                "ti": tokens_in,
+                "to": tokens_out,
+                "c": cost_usd,
+                "err": _jsonb(redact(error)) if error else None,
+            },
+        )
+        return step_id, seq
+    # --- Budget / time -------------------------------------------------
+    async def _budget_or_terminal(
+        self,
+        *,
+        s: AsyncSession,
+        run_id: str,
+        org_id: str,
+        agent_version_id: str,
+        config: AgentConfig,
+    ) -> TerminalReason | None:
+        row = (
+            await s.execute(
+                text(
+                    "SELECT iteration_count, tool_call_count, tokens_in, tokens_out, "
+                    "       cost_usd, started_at "
+                    "FROM agent_runs WHERE id = :i"
+                ),
+                {"i": run_id},
+            )
+        ).mappings().one()
+        now = _now()
+        elapsed = (now - row["started_at"]).total_seconds()
+        if elapsed > config.limits.max_seconds:
+            await self._write_terminated(
+                s=s, org_id=org_id, run_id=run_id, agent_version_id=agent_version_id,
+                reason="timed_out", detail={"elapsed_seconds": round(elapsed, 2)},
+            )
+            return "timed_out"
+        if row["iteration_count"] > config.limits.max_steps:
+            await self._write_terminated(
+                s=s, org_id=org_id, run_id=run_id, agent_version_id=agent_version_id,
+                reason="budget_exceeded",
+                detail={"limit": "max_steps", "value": config.limits.max_steps},
+            )
+            return "budget_exceeded"
+        if row["tool_call_count"] > config.limits.max_tool_calls:
+            await self._write_terminated(
+                s=s, org_id=org_id, run_id=run_id, agent_version_id=agent_version_id,
+                reason="budget_exceeded",
+                detail={"limit": "max_tool_calls", "value": config.limits.max_tool_calls},
+            )
+            return "budget_exceeded"
+        cost = Decimal(str(row["cost_usd"]))
+        if cost > config.limits.max_cost_usd:
+            await self._write_terminated(
+                s=s, org_id=org_id, run_id=run_id, agent_version_id=agent_version_id,
+                reason="budget_exceeded",
+                detail={
+                    "limit": "max_cost_usd",
+                    "value": str(config.limits.max_cost_usd),
+                    "actual": str(cost),
+                },
+            )
+            return "budget_exceeded"
+        return None
+    # --- Terminal -----------------------------------------------------
+    async def _write_terminated(
+        self,
+        *,
+        s: AsyncSession,
+        org_id: str,
+        run_id: str,
+        agent_version_id: str,
+        reason: str,
+        detail: dict[str, Any] | None = None,
+        output: dict[str, Any] | None = None,
+    ) -> None:
+        if reason not in TERMINAL_REASONS:
+            raise EngineError("invalid terminal reason: " + reason)
+        await self._append_step(
+            s=s, org_id=org_id, run_id=run_id, agent_version_id=agent_version_id,
+            step_type="terminated", status=reason,
+            input_data={"reason": reason, "detail": detail or {}},
+            output_data=redact(output) if output else None,
+        )
+        await s.execute(
+            text(
+                "UPDATE agent_runs "
+                "SET status = :st, terminal_reason = :r, finished_at = now(), "
+                "    lease_holder = NULL, lease_expires_at = NULL, "
+                "    output = CAST(:out AS jsonb) "
+                "WHERE id = :i"
+            ),
+            {
+                "st": reason,
+                "r": reason,
+                "out": _jsonb(redact(output)) if output else None,
+                "i": run_id,
+            },
+        )
+    async def _write_escalation(
+        self,
+        *,
+        s: AsyncSession,
+        org_id: str,
+        run_id: str,
+        agent_version_id: str,
+        reason: str,
+        context: dict[str, Any],
+        tool_call_id: str | None = None,
+    ) -> str:
+        esc_id = uuid7str()
+        await s.execute(
+            text(
+                "INSERT INTO escalations "
+                "(id, org_id, execution_id, agent_version_id, tool_call_id, "
+                " reason, priority, context, status) "
+                "VALUES (:id, :o, :e, :v, :tc, :r, 'normal', CAST(:ctx AS jsonb), 'open')"
+            ),
+            {
+                "id": esc_id,
+                "o": org_id,
+                "e": run_id,
+                "v": agent_version_id,
+                "tc": tool_call_id,
+                "r": reason,
+                "ctx": _jsonb(redact(context)),
+            },
+        )
+        return esc_id
+    # --- Resume pre-check ----------------------------------------------
+    async def _resume_pre_check(
+        self, *, run_id: str, org_id: str, agent_version_id: str
+    ) -> None:
+        async with tenant_session(org_id) as s:
+            row = (
+                await s.execute(
+                    text(
+                        "SELECT id FROM tool_calls "
+                        "WHERE execution_id = :e AND status = 'executing' "
+                        "  AND idempotency_mode_snapshot = 'none' "
+                        "  AND idempotency_key IS NULL "
+                        "LIMIT 1"
+                    ),
+                    {"e": run_id},
+                )
+            ).first()
+            if row is not None:
+                stuck_call_id = row[0]
+                await s.execute(
+                    text("UPDATE tool_calls SET status = 'stuck' WHERE id = :i"),
+                    {"i": stuck_call_id},
+                )
+                esc_id = await self._write_escalation(
+                    s=s,
+                    org_id=org_id,
+                    run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="indeterminate_side_effect",
+                    context={"stuck_tool_call_id": stuck_call_id},
+                    tool_call_id=stuck_call_id,
+                )
+                await self._write_terminated(
+                    s=s,
+                    org_id=org_id,
+                    run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="escalated",
+                    detail={
+                        "reason": "indeterminate_side_effect",
+                        "escalation_id": esc_id,
+                    },
+                )
+                raise IndeterminateSideEffectError(stuck_call_id)
+    # --- Heartbeat ------------------------------------------------------
+    @asynccontextmanager
+    async def _heartbeat(
+        self, *, run_id: str, org_id: str, epoch: int
+    ) -> AsyncIterator[None]:
+        stop = asyncio.Event()
+        async def loop() -> None:
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(
+                        stop.wait(),
+                        timeout=self._config.heartbeat_interval_seconds,
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    async with tenant_session(org_id) as s:
+                        await self._fence_and_heartbeat(
+                            s=s, run_id=run_id, epoch=epoch
+                        )
+                except StaleLeaseError:
+                    log.warning(
+                        "heartbeat_lost_lease",
+                        extra={"run_id": run_id, "epoch": epoch},
+                    )
+                    return
+        task = asyncio.create_task(loop())
+        try:
+            yield
+        finally:
+            stop.set()
+            with suppress(asyncio.CancelledError):
+                await task
+    # --- Persist a tool call (single writer) --------------------------
+    async def _persist_tool_call(
+        self,
+        *,
+        s: AsyncSession,
+        org_id: str,
+        run_id: str,
+        step_id: str,
+        agent_version_id: str,
+        tool: ResolvedTool,
+        arguments: dict[str, Any],
+        idempotency_key: str | None,
+        status: str,
+    ) -> str:
+        call_id = uuid7str()
+        # 4.1-D: validate arguments against the tool input schema before
+        # persisting. A schema violation raises EngineError, which
+        # _step_tool_call catches and records as a failed tool_call.
+        try:
+            jsonschema.validate(instance=arguments, schema=tool.input_schema)
+        except jsonschema.ValidationError as exc:
+            raise EngineError(
+                f"tool {tool.key!r} argument validation failed: {exc.message}"
+            ) from exc
+        await s.execute(
+            text(
+                "INSERT INTO tool_calls "
+                "(id, org_id, execution_id, step_id, agent_version_id, tool_id, "
+                " tool_key_snapshot, risk_class_snapshot, idempotency_mode_snapshot, "
+                " input, input_redacted, status, idempotency_key, escalation_id) "
+                "VALUES "
+                "(:id, :o, :e, :sp, :v, :t, :tk, :rc, :im, CAST(:inp AS jsonb), true, "
+                " :st, :ik, :esc)"
+            ),
+            {
+                "id": call_id,
+                "o": org_id,
+                "e": run_id,
+                "sp": step_id,
+                "v": agent_version_id,
+                "t": tool.id,
+                "tk": tool.key,
+                "rc": tool.risk_class,
+                "im": tool.idempotency_mode,
+                "inp": _jsonb(redact(arguments)),
+                "st": status,
+                "ik": idempotency_key,
+                "esc": None,
+            },
+        )
+        return call_id
+    # --- State loader ----------------------------------------------------
+    async def _load_state(
+        self, *, run_id: str, org_id: str
+    ) -> _LoadedState:
+        """Build the frozen RunState for decide_next_step.
+        Single short read; no long-held transactions. Returns the last 10
+        steps (enough to see the current cycle), counters, run_context
+        fields, agent config, and the tri-state terminal-tool status.
+        """
+        async with tenant_session(org_id) as s:
+            run_row = (
+                await s.execute(
+                    text(
+                        "SELECT agent_version_id, iteration_count, tool_call_count, "
+                        "       cost_usd, started_at, status "
+                        "FROM agent_runs WHERE id = :i"
+                    ),
+                    {"i": run_id},
+                )
+            ).mappings().first()
+            if run_row is None:
+                raise RunNotFound(run_id)
+            version_row = (
+                await s.execute(
+                    text(
+                        "SELECT version, config FROM agent_versions WHERE id = :v"
+                    ),
+                    {"v": run_row["agent_version_id"]},
+                )
+            ).mappings().first()
+            if version_row is None:
+                raise EngineError(
+                    "agent_version missing for run " + run_id
+                )
+            config = AgentConfig.model_validate(version_row["config"])
+            steps_rows = (
+                await s.execute(
+                    text(
+                        "SELECT seq, type, status FROM execution_steps "
+                        "WHERE execution_id = :e ORDER BY seq DESC LIMIT 10"
+                    ),
+                    {"e": run_id},
+                )
+            ).mappings().all()
+            steps = tuple(reversed(steps_rows))
+            ctx_row = (
+                await s.execute(
+                    text(
+                        "SELECT consecutive_rejections, scratch "
+                        "FROM run_context WHERE execution_id = :e"
+                    ),
+                    {"e": run_id},
+                )
+            ).mappings().first()
+            ctx_consecutive_rejections = (
+                int(ctx_row["consecutive_rejections"]) if ctx_row else 0
+            )
+            scratch = (ctx_row["scratch"] if ctx_row else {}) or {}
+            nudge_issued = bool(scratch.get("expected_terminal_nudge_issued", False))
+            # Pending proposal count: proposals in the most recent
+            # llm_response that have not yet been turned into tool_proposed
+            # or tool_rejected steps.
+            pending_proposals = 0
+            last_step_type: str | None = None
+            if steps:
+                last_step_type = str(steps[-1]["type"])
+            # Find most recent llm_response and count proposals made
+            # (proposals are in the llm_response step's output.tool_call_count,
+            #  if present) minus decisions already recorded after it.
+            for row in reversed(steps):
+                if row["type"] == "llm_response":
+                    output = (await s.execute(
+                        text(
+                            "SELECT output FROM execution_steps WHERE execution_id = :e AND seq = :sq"
+                        ),
+                        {"e": run_id, "sq": int(row["seq"])},
+                    )).scalar_one()
+                    proposed = int((output or {}).get("tool_call_count", 0))
+                    decided = sum(
+                        1 for r in steps
+                        if int(r["seq"]) > int(row["seq"])
+                        and r["type"] in ("tool_proposed", "tool_rejected")
+                    )
+                    pending_proposals = max(0, proposed - decided)
+                    break
+            terminal_status = await self._terminal_tool_status(
+                s=s, run_id=run_id, expected_key=config.expected_terminal_tool
+            )
+        elapsed = (_now() - run_row["started_at"]).total_seconds()
+        return _LoadedState(
+            steps=steps,
+            counters={
+                "iteration_count": int(run_row["iteration_count"]),
+                "tool_call_count": int(run_row["tool_call_count"]),
+                "cost_usd": float(run_row["cost_usd"]),
+                "elapsed_seconds": elapsed,
+            },
+            consecutive_rejections=ctx_consecutive_rejections,
+            nudge_issued=nudge_issued,
+            config=config,
+            terminal_tool_status=terminal_status,
+            pending_proposal_count=pending_proposals,
+            last_step_type=last_step_type,
+            agent_version_id=str(run_row["agent_version_id"]),
+            version=int(version_row["version"]),
+            status=str(run_row["status"]),
+        )
+    async def _terminal_tool_status(
+        self,
+        *,
+        s: AsyncSession,
+        run_id: str,
+        expected_key: str | None,
+    ) -> TerminalToolStatus:
+        """Tri-state check on the expected_terminal_tool for this run."""
+        if expected_key is None:
+            return "not_run"
+        row = (
+            await s.execute(
+                text(
+                    "SELECT status, verified FROM tool_calls "
+                    "WHERE execution_id = :e AND tool_key_snapshot = :k "
+                    "ORDER BY started_at DESC LIMIT 1"
+                ),
+                {"e": run_id, "k": expected_key},
+            )
+        ).mappings().first()
+        if row is None:
+            return "not_run"
+        status = str(row["status"])
+        verified = row["verified"]
+        if status in ("failed", "rejected", "stuck"):
+            return "ran_failed"
+        if status in ("executing",):
+            # Mid-flight: for verification purposes, treat as failed unless
+            # the resume pre-check already intervened (which would have
+            # escalated earlier).
+            return "ran_failed"
+        if status == "completed":
+            return "ran_ok_verified" if verified is True else "ran_ok_unverified"
+        return "not_run"
+    # --- Heartbeat -------------------------------------------------------
+    @asynccontextmanager
+    async def _heartbeat_cancels_loop(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        main_task: "asyncio.Task[TerminalReason]",
+    ) -> AsyncIterator[None]:
+        """Refreshes the lease. On fence loss, cancels the loop task."""
+        stop = asyncio.Event()
+        async def loop() -> None:
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(
+                        stop.wait(),
+                        timeout=self._config.heartbeat_interval_seconds,
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    async with tenant_session(org_id) as s:
+                        await self._fence_and_heartbeat(
+                            s=s, run_id=run_id, epoch=epoch
+                        )
+                except StaleLeaseError:
+                    log.warning(
+                        "heartbeat_lease_lost_cancelling_loop",
+                        extra={"run_id": run_id, "epoch": epoch},
+                    )
+                    main_task.cancel()
+                    return
+        task = asyncio.create_task(loop())
+        try:
+            yield
+        finally:
+            stop.set()
+            with suppress(asyncio.CancelledError):
+                await task
+    # --- Public entry point ---------------------------------------------
+    async def run_once(self, *, run_id: str, org_id: str) -> TerminalReason:
+        """Drive the run to a terminal state. Idempotent per state rules."""
+        import uuid as _uuid
+        holder = "worker-" + _uuid.uuid4().hex[:8]
+        epoch = await self._claim_lease(run_id=run_id, org_id=org_id, holder=holder)
+        # Load agent_version_id early for the resume pre-check
+        state0 = await self._load_state(run_id=run_id, org_id=org_id)
+        agent_version_id = state0.agent_version_id
+        # Resume pre-check runs before the loop.
+        try:
+            await self._resume_pre_check(
+                run_id=run_id, org_id=org_id, agent_version_id=agent_version_id
+            )
+        except IndeterminateSideEffectError:
+            # _resume_pre_check already wrote escalation and terminal.
+            # Release lease and re-raise so caller sees the outcome.
+            await self._release_lease(run_id=run_id, org_id=org_id, epoch=epoch)
+            raise
+        loop_task: "asyncio.Task[TerminalReason]" = asyncio.create_task(
+            self._loop(run_id=run_id, org_id=org_id, epoch=epoch)
+        )
+        stale = False
+        try:
+            async with self._heartbeat_cancels_loop(
+                run_id=run_id, org_id=org_id, epoch=epoch, main_task=loop_task
+            ):
+                return await loop_task
+        except asyncio.CancelledError:
+            log.info(
+                "run_cancelled_by_heartbeat",
+                extra={"run_id": run_id, "epoch": epoch},
+            )
+            raise
+        except StaleLeaseError:
+            stale = True
+            log.warning(
+                "run_aborted_stale_lease",
+                extra={"run_id": run_id, "epoch": epoch},
+            )
+            raise
+        finally:
+            # Release the lease ONLY if we still own this epoch and the run
+            # is not in the stale/cancelled path. _release_lease is already
+            # epoch-fenced, so a stale caller is a no-op; explicit stale flag
+            # documents the intent and avoids any redundant UPDATE.
+            if not stale and not loop_task.cancelled():
+                with suppress(Exception):
+                    await self._release_lease(
+                        run_id=run_id, org_id=org_id, epoch=epoch
+                    )
+    # --- The loop --------------------------------------------------------
+    async def _loop(
+        self, *, run_id: str, org_id: str, epoch: int
+    ) -> TerminalReason:
+        while True:
+            state = await self._load_state(run_id=run_id, org_id=org_id)
+            run_state = RunState(
+                steps=state.steps,
+                iteration_count=state.counters["iteration_count"],
+                tool_call_count=state.counters["tool_call_count"],
+                cost_usd=state.counters["cost_usd"],
+                elapsed_seconds=state.counters["elapsed_seconds"],
+                consecutive_rejections=state.consecutive_rejections,
+                nudge_issued=state.nudge_issued,
+                config=state.config,
+                terminal_tool_status=state.terminal_tool_status,
+                pending_proposal_count=state.pending_proposal_count,
+                last_step_type=state.last_step_type,
+            )
+            decision = decide_next_step(run_state)
+            if decision.kind == "terminate":
+                reason = decision.terminal_reason
+                if reason is None:
+                    raise EngineError("terminate without terminal_reason")
+                async with tenant_session(org_id) as s:
+                    await self._fence_and_heartbeat(
+                        s=s, run_id=run_id, epoch=epoch
+                    )
+                    detail: dict[str, Any] = {"from": "decide_next_step"}
+                    if reason == "escalated":
+                        esc_reason = decision.escalation_reason or "policy_terminate"
+                        esc_id = await self._write_escalation(
+                            s=s,
+                            org_id=org_id,
+                            run_id=run_id,
+                            agent_version_id=state.agent_version_id,
+                            reason=esc_reason,
+                            context={
+                                "consecutive_rejections": state.consecutive_rejections,
+                                "last_step_type": state.last_step_type,
+                                "terminal_tool_status": state.terminal_tool_status,
+                                "nudge_issued": state.nudge_issued,
+                            },
+                        )
+                        detail["escalation_id"] = esc_id
+                        detail["escalation_reason"] = esc_reason
+                    await self._write_terminated(
+                        s=s,
+                        org_id=org_id,
+                        run_id=run_id,
+                        agent_version_id=state.agent_version_id,
+                        reason=reason,
+                        detail=detail,
+                    )
+                return reason
+            try:
+                if decision.kind == "reasoning":
+                    await self._step_reasoning(
+                        run_id=run_id,
+                        org_id=org_id,
+                        epoch=epoch,
+                        agent_version_id=state.agent_version_id,
+                        config=state.config,
+                        nudge=(
+                            state.config.expected_terminal_tool is not None
+                            and not state.nudge_issued
+                            and state.terminal_tool_status == "not_run"
+                            and state.last_step_type == "llm_response"
+                            and state.pending_proposal_count == 0
+                        ),
+                    )
+                    continue
+                if decision.kind == "policy_check":
+                    await self._step_policy_check(
+                        run_id=run_id,
+                        org_id=org_id,
+                        epoch=epoch,
+                        agent_version_id=state.agent_version_id,
+                        config=state.config,
+                    )
+                    continue
+                if decision.kind == "tool_call":
+                    await self._step_tool_call(
+                        run_id=run_id,
+                        org_id=org_id,
+                        epoch=epoch,
+                        agent_version_id=state.agent_version_id,
+                        config=state.config,
+                    )
+                    continue
+                if decision.kind == "verifying":
+                    reason = await self._step_verifying(
+                        run_id=run_id,
+                        org_id=org_id,
+                        epoch=epoch,
+                        agent_version_id=state.agent_version_id,
+                        config=state.config,
+                        nudge=decision.post_nudge,
+                    )
+                    if reason is not None:
+                        return reason
+                    continue
+                raise EngineError("unknown StepKind: " + str(decision.kind))
+            except StaleLeaseError:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Any step handler exception is a terminal failure, not a
+                # stuck run. Per 7, every run must reach a deterministic
+                # terminal state. Write terminated(failed) and return.
+                async with tenant_session(org_id) as s:
+                    await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+                    await self._write_terminated(
+                        s=s, org_id=org_id, run_id=run_id,
+                        agent_version_id=state.agent_version_id,
+                        reason="failed",
+                        detail={
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc)[:500],
+                            "from_step": decision.kind,
+                        },
+                    )
+                return "failed"
+    # --- Step handlers (filled in Turn 2) -------------------------------
+    async def _step_reasoning(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        agent_version_id: str,
+        config: AgentConfig,
+        nudge: bool,
+    ) -> None:
+        """One LLM call: write intent step, call LLM, write result step.
+        No DB transaction is held while the LLM is running. The intent step
+        is durable so resume can detect a crash mid-call.
+        """
+        # ---- Phase 1: build request in a short tx ----
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+            ctx_row = (
+                await s.execute(
+                    text(
+                        "SELECT messages, scratch FROM run_context "
+                        "WHERE execution_id = :e"
+                    ),
+                    {"e": run_id},
+                )
+            ).mappings().first()
+            if ctx_row is None:
+                # First reasoning step: seed run_context.
+                ctx_id = uuid7str()
+                await s.execute(
+                    text(
+                        "INSERT INTO run_context "
+                        "(id, org_id, execution_id, agent_version_id) "
+                        "VALUES (:i, :o, :e, :v)"
+                    ),
+                    {"i": ctx_id, "o": org_id, "e": run_id, "v": agent_version_id},
+                )
+                existing_messages: list[dict[str, Any]] = []
+                scratch: dict[str, Any] = {}
+            else:
+                existing_messages = list(ctx_row["messages"] or [])
+                scratch = dict(ctx_row["scratch"] or {})
+            messages = list(existing_messages)
+            if not messages:
+                messages.append({"role": "system", "content": config.instructions})
+                run_input = (
+                    await s.execute(
+                        text("SELECT input FROM agent_runs WHERE id = :i"),
+                        {"i": run_id},
+                    )
+                ).scalar_one()
+                if isinstance(run_input, str):
+                    run_input = json.loads(run_input)
+                task = (run_input or {}).get("message")
+                if not isinstance(task, str) or not task.strip():
+                    task = _jsonb(run_input or {})
+                messages.append({"role": "user", "content": task})
+            if nudge and not scratch.get("expected_terminal_nudge_issued"):
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "You have not yet completed the required action. "
+                        "You must call the expected terminal tool before finishing."
+                    ),
+                })
+                scratch["expected_terminal_nudge_issued"] = True
+            # Turn messages into LLMMessage objects
+            from app.adapters.llm.base import LLMMessage, LLMRequest, ToolSpec
+            llm_messages = [
+                LLMMessage(
+                    role=m["role"],
+                    content=m.get("content"),
+                )
+                for m in messages
+            ]
+            tools = [
+                ToolSpec(
+                    name=t.key,
+                    description=t.description,
+                    input_schema=t.input_schema,
+                )
+                for t in ()
+            ]
+            # Build from resolved tools the engine already has via agent config.
+            # NOTE: caller passes ResolvedTools; here we only have config.
+            # The loop is expected to have run a service resolve before
+            # run_once; for MVP we re-resolve tools from agent_tool_grants.
+            tool_rows = (
+                await s.execute(
+                    text(
+                        "SELECT t.key, t.description, t.input_schema "
+                        "FROM agent_tool_grants g JOIN tools t ON t.id = g.tool_id "
+                        "WHERE g.agent_version_id = :v ORDER BY t.key"
+                    ),
+                    {"v": agent_version_id},
+                )
+            ).mappings().all()
+            tools = [
+                ToolSpec(
+                    name=r["key"],
+                    description=r["description"],
+                    input_schema=r["input_schema"],
+                )
+                for r in tool_rows
+            ]
+            max_tokens = min(config.max_output_tokens, 1024)
+            request = LLMRequest(
+                model=config.model,
+                messages=llm_messages,
+                tools=tools,
+                temperature=config.temperature,
+                max_output_tokens=max_tokens,
+            )
+            step_id, _seq = await self._append_step(
+                s=s,
+                org_id=org_id,
+                run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="llm_request",
+                status="ok",
+                input_data={
+                    "model": config.model,
+                    "message_count": len(llm_messages),
+                    "tool_count": len(tools),
+                },
+                model=config.model,
+            )
+            await s.execute(
+                text(
+                    "UPDATE agent_runs SET iteration_count = iteration_count + 1 "
+                    "WHERE id = :i"
+                ),
+                {"i": run_id},
+            )
+        # ---- Phase 2: call LLM, no tx held ----
+        response = await self._llm.complete(request)
+        # ---- Phase 3: persist response in a short tx ----
+        cost = self._config.cost_for(
+            response.model,
+            response.usage.prompt_tokens,
+            response.usage.completion_tokens,
+        )
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+            await self._append_step(
+                s=s,
+                org_id=org_id,
+                run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="llm_response",
+                status="ok",
+                input_data={},
+                output_data={
+                    "content": response.content,
+                    "tool_call_count": len(response.tool_calls),
+                    "finish_reason": response.finish_reason,
+                    "tool_calls": [
+                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                        for tc in response.tool_calls
+                    ],
+                },
+                model=response.model,
+                tokens_in=response.usage.prompt_tokens,
+                tokens_out=response.usage.completion_tokens,
+                cost_usd=cost,
+            )
+            new_messages = list(messages)
+            new_messages.append(
+                {
+                    "role": "assistant",
+                    "content": response.content,
+                    "tool_calls": [
+                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                        for tc in response.tool_calls
+                    ],
+                }
+            )
+            await s.execute(
+                text(
+                    "UPDATE run_context "
+                    "SET messages = CAST(:m AS jsonb), scratch = CAST(:sc AS jsonb), "
+                    "    updated_at = now() "
+                    "WHERE execution_id = :e"
+                ),
+                {
+                    "m": _jsonb(new_messages),
+                    "sc": _jsonb(scratch),
+                    "e": run_id,
+                },
+            )
+            await s.execute(
+                text(
+                    "UPDATE agent_runs "
+                    "SET tokens_in = tokens_in + :ti, tokens_out = tokens_out + :to, "
+                    "    cost_usd = cost_usd + :c "
+                    "WHERE id = :i"
+                ),
+                {
+                    "ti": response.usage.prompt_tokens,
+                    "to": response.usage.completion_tokens,
+                    "c": cost,
+                    "i": run_id,
+                },
+            )
+    async def _step_policy_check(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        agent_version_id: str,
+        config: AgentConfig,
+    ) -> None:
+        """Deterministic checks on pending proposals. Writes tool_proposed or tool_rejected."""
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+            # Get the last llm_response output that has not been fully decided.
+            rows = (
+                await s.execute(
+                    text(
+                        "SELECT seq, output FROM execution_steps "
+                        "WHERE execution_id = :e AND type = 'llm_response' "
+                        "ORDER BY seq DESC LIMIT 1"
+                    ),
+                    {"e": run_id},
+                )
+            ).mappings().first()
+            if rows is None:
+                return
+            proposals_raw = (rows["output"] or {}).get("tool_calls", [])
+            decided_count = (
+                await s.execute(
+                    text(
+                        "SELECT COUNT(*) FROM execution_steps "
+                        "WHERE execution_id = :e AND seq > :sq "
+                        "AND type IN ('tool_proposed','tool_rejected')"
+                    ),
+                    {"e": run_id, "sq": int(rows["seq"])},
+                )
+            ).scalar_one()
+            if int(decided_count) >= len(proposals_raw):
+                return
+            proposal = proposals_raw[int(decided_count)]
+            tool_key = proposal["name"]
+            # Look up tool to verify it exists and is granted
+            tool_row = (
+                await s.execute(
+                    text(
+                        "SELECT t.id, t.key, t.risk_class, t.approval_policy, "
+                        "       t.idempotency_mode, t.input_schema, t.timeout_ms, "
+                        "       t.org_id AS tool_org "
+                        "FROM tools t "
+                        "JOIN agent_tool_grants g ON g.tool_id = t.id "
+                        "WHERE g.agent_version_id = :v AND t.key = :k"
+                    ),
+                    {"v": agent_version_id, "k": tool_key},
+                )
+            ).mappings().first()
+            if tool_row is None:
+                await self._reject_proposal(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    tool_key=tool_key, tool_call_id=proposal["id"],
+                    reason="not_granted", trace_extra={},
+                    role_tool_message="Tool not available.",
+                )
+                return
+            try:
+                jsonschema.validate(
+                    instance=proposal["arguments"], schema=tool_row["input_schema"]
+                )
+            except jsonschema.ValidationError as exc:
+                vpath = "/".join(str(p) for p in exc.absolute_path) or "<root>"
+                await self._reject_proposal(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    tool_key=tool_key, tool_call_id=proposal["id"],
+                    reason="invalid_arguments",
+                    trace_extra={"validator": exc.validator, "path": vpath},
+                    role_tool_message=(
+                        f"Invalid arguments for {tool_key}: "
+                        f"'{exc.validator}' failed at {vpath}."
+                    ),
+                )
+                return
+            except Exception:
+                await self._escalate_misconfigured(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id, tool_key=tool_key,
+                )
+                return
+            # Compute idempotency key if mode=keyed
+            idem_key: str | None = None
+            if tool_row["idempotency_mode"] == "keyed":
+                idem_key = compute_idempotency_key(
+                    execution_id=run_id,
+                    agent_version_id=agent_version_id,
+                    tool_id=str(tool_row["id"]),
+                    arguments=proposal["arguments"],
+                )
+            # Write the tool_proposed step. Actual execution is the next step.
+            await self._append_step(
+                s=s,
+                org_id=org_id,
+                run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="tool_proposed",
+                status="ok",
+                input_data={
+                    "tool": tool_key,
+                    "arguments": proposal["arguments"],
+                    "risk_class": tool_row["risk_class"],
+                    "approval_policy": tool_row["approval_policy"],
+                    "idempotency_mode": tool_row["idempotency_mode"],
+                    "idempotency_key": idem_key,
+                    "tool_id": str(tool_row["id"]),
+                    "call_id": proposal["id"],
+                    "tool_timeout_ms": int(tool_row["timeout_ms"]),
+                },
+            )
+            # Reset consecutive_rejections on first proposal
+            await s.execute(
+                text(
+                    "UPDATE run_context SET consecutive_rejections = 0, "
+                    "updated_at = now() WHERE execution_id = :e"
+                ),
+                {"e": run_id},
+            )
+    # --- Rejection and escalation helpers (Patch A) ----------------------
+    async def _reject_proposal(
+        self,
+        *,
+        s: AsyncSession,
+        org_id: str,
+        run_id: str,
+        agent_version_id: str,
+        tool_key: str,
+        tool_call_id: str,
+        reason: str,
+        trace_extra: dict[str, Any],
+        role_tool_message: str | None = None,
+    ) -> None:
+        """Write tool_rejected, increment consecutive_rejections, and
+        append a role=tool message to run_context.messages so the model
+        can correct. All in the caller transaction (one fenced tx)."""
+        await self._append_step(
+            s=s,
+            org_id=org_id,
+            run_id=run_id,
+            agent_version_id=agent_version_id,
+            step_type="tool_rejected",
+            status="ok",
+            input_data={"tool": tool_key, "reason": reason, **trace_extra},
+        )
+        await s.execute(
+            text(
+                "UPDATE run_context "
+                "SET consecutive_rejections = consecutive_rejections + 1, "
+                "    updated_at = now() "
+                "WHERE execution_id = :e"
+            ),
+            {"e": run_id},
+        )
+        if role_tool_message is not None:
+            msg = {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": tool_key,
+                "content": role_tool_message,
+            }
+            await s.execute(
+                text(
+                    "UPDATE run_context "
+                    "SET messages = messages || CAST(:m AS jsonb), "
+                    "    updated_at = now() "
+                    "WHERE execution_id = :e"
+                ),
+                {"m": _jsonb([msg]), "e": run_id},
+            )
+    async def _escalate_misconfigured(
+        self,
+        *,
+        s: AsyncSession,
+        org_id: str,
+        run_id: str,
+        agent_version_id: str,
+        tool_key: str,
+    ) -> str:
+        """Escalate tool_misconfigured (bad input_schema or unresolvable
+        $ref). Writes escalation and terminated(escalated). Returns esc_id.
+        No str(exc), no role=tool message, no consecutive_rejections bump."""
+        esc_id = await self._write_escalation(
+            s=s,
+            org_id=org_id,
+            run_id=run_id,
+            agent_version_id=agent_version_id,
+            reason="tool_misconfigured",
+            context={"tool": tool_key},
+        )
+        await self._write_terminated(
+            s=s,
+            org_id=org_id,
+            run_id=run_id,
+            agent_version_id=agent_version_id,
+            reason="escalated",
+            detail={"reason": "tool_misconfigured", "escalation_id": esc_id},
+        )
+        return esc_id
+    async def _escalate_indeterminate(
+        self,
+        *,
+        s: AsyncSession,
+        org_id: str,
+        run_id: str,
+        agent_version_id: str,
+        stuck_call_id: str,
+    ) -> str:
+        """Mark the tool_calls row stuck, write indeterminate_side_effect
+        escalation, return esc_id. Caller writes terminated and decides
+        whether to raise (resume path) or return (loop catch-all)."""
+        await s.execute(
+            text("UPDATE tool_calls SET status = 'stuck' WHERE id = :i"),
+            {"i": stuck_call_id},
+        )
+        esc_id = await self._write_escalation(
+            s=s,
+            org_id=org_id,
+            run_id=run_id,
+            agent_version_id=agent_version_id,
+            reason="indeterminate_side_effect",
+            context={"stuck_tool_call_id": stuck_call_id},
+            tool_call_id=stuck_call_id,
+        )
+        return esc_id
+    async def _load_full_tool(
+        self, *, s: AsyncSession, tool_id: str
+    ) -> ResolvedTool:
+        """Load the full tool row for executor-side schema validation (4.1-D).
+        The proposal snapshot in execution_steps.input carries only the fields
+        that _step_policy_check persisted, which did not include the schemas.
+        Re-read the row inside the caller transaction so the executor sees
+        a real input_schema and can validate arguments before any I/O.
+        """
+        row = (
+            await s.execute(
+                text(
+                    "SELECT id, key, name, description, input_schema, output_schema, "
+                    "       risk_class, approval_policy, timeout_ms, idempotency_mode "
+                    "FROM tools WHERE id = :tid"
+                ),
+                {"tid": tool_id},
+            )
+        ).mappings().first()
+        if row is None:
+            raise EngineError(f"tool {tool_id!r} no longer exists")
+        return ResolvedTool(
+            id=row["id"],
+            key=row["key"],
+            name=row["name"],
+            description=row["description"],
+            input_schema=row["input_schema"],
+            output_schema=row["output_schema"],
+            risk_class=row["risk_class"],
+            approval_policy=row["approval_policy"],
+            timeout_ms=int(row["timeout_ms"]),
+            idempotency_mode=row["idempotency_mode"],
+            grant_config={},
+        )
+    async def _step_tool_call(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        agent_version_id: str,
+        config: AgentConfig,
+    ) -> None:
+        """Execute one approved proposal. Writes tool_executing then tool_result."""
+        # Phase 1: read the proposal, persist intent (or detect a prior attempt)
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+            last_proposed = (
+                await s.execute(
+                    text(
+                        "SELECT id, seq, input FROM execution_steps "
+                        "WHERE execution_id = :e AND type = 'tool_proposed' "
+                        "ORDER BY seq DESC LIMIT 1"
+                    ),
+                    {"e": run_id},
+                )
+            ).mappings().first()
+            if last_proposed is None:
+                raise EngineError("no tool_proposed step to execute")
+            proposed_input = last_proposed["input"]
+            proposal_step_id = str(last_proposed["id"])
+            tool = await self._load_full_tool(
+                s=s, tool_id=proposed_input["tool_id"]
+            )
+            try:
+                executor = self._tool_registry.executor_for(tool.key)
+            except EngineError:
+                await self._escalate_misconfigured(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id, tool_key=tool.key,
+                )
+                return
+
+            prior = (
+                await s.execute(
+                    text(
+                        "SELECT id, status, idempotency_mode_snapshot "
+                        "FROM tool_calls "
+                        "WHERE execution_id = :e AND step_id = :sid"
+                    ),
+                    {"e": run_id, "sid": proposal_step_id},
+                )
+            ).mappings().first()
+
+            if prior is None:
+                await self._append_step(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    step_type="tool_executing", status="executing",
+                    input_data={"tool": proposed_input["tool"]},
+                )
+                call_id = await self._persist_tool_call(
+                    s=s, org_id=org_id, run_id=run_id,
+                    step_id=proposal_step_id,
+                    agent_version_id=agent_version_id,
+                    tool=tool,
+                    arguments=proposed_input["arguments"],
+                    idempotency_key=proposed_input.get("idempotency_key"),
+                    status="executing",
+                )
+            elif prior["status"] == "stuck":
+                return
+            elif prior["status"] in ("completed", "failed"):
+                raise EngineError("tool_call finalized without tool_result step")
+            elif prior["idempotency_mode_snapshot"] == "keyed":
+                call_id = str(prior["id"])
+            else:
+                esc_id = await self._escalate_indeterminate(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    stuck_call_id=str(prior["id"]),
+                )
+                await self._write_terminated(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="escalated",
+                    detail={
+                        "reason": "indeterminate_side_effect",
+                        "escalation_id": esc_id,
+                    },
+                )
+                return
+        # Phase 2: execute tool with timeout, NO tx held
+        # SECURITY FIX: Timeout enforced from tool config, not LLM proposal.
+        timeout_s = float(tool.timeout_ms) / 1000.0 if tool.timeout_ms else 15.0
+        timed_out = False
+        try:
+            result = await asyncio.wait_for(
+                executor(
+                    tool=tool,
+                    arguments=proposed_input["arguments"],
+                    idempotency_key=proposed_input.get("idempotency_key"),
+                    timeout_seconds=timeout_s,
+                ),
+                timeout=timeout_s + 5.0,
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            result = ToolResult(ok=False, error=TimeoutError("tool timeout"))
+        except Exception as exc:
+            result = ToolResult(ok=False, error=exc)
+        # Phase 3: run post_check if present (no tx held)
+        verified: bool | None = result.verified
+        post_check_exc: BaseException | None = None
+        if result.ok:
+            post_check = self._tool_registry.post_check_for(tool.key)
+            if post_check is not None:
+                try:
+                    verified = await post_check(
+                        proposed_input["arguments"], result.output
+                    )
+                except Exception as exc:
+                    post_check_exc = exc
+                    verified = None
+        # Phase 4: persist result in a short tx
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+            if timed_out and tool.idempotency_mode != "keyed":
+                esc_id = await self._escalate_indeterminate(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    stuck_call_id=str(call_id),
+                )
+                await self._write_terminated(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="escalated",
+                    detail={"reason": "indeterminate_side_effect",
+                            "escalation_id": esc_id},
+                )
+                return
+            call_status = "completed" if result.ok else "failed"
+            await s.execute(
+                text(
+                    "UPDATE tool_calls "
+                    "SET status = :st, output = CAST(:out AS jsonb), "
+                    "    output_redacted = true, verified = :v, finished_at = now(), "
+                    "    error = CAST(:err AS jsonb) "
+                    "WHERE id = :i"
+                ),
+                {
+                    "st": call_status,
+                    "out": _jsonb(redact(result.output)) if result.ok else None,
+                    "v": verified,
+                    "err": (
+                        _jsonb(redact(_error_dict(result.error)))
+                        if result.error else None
+                    ),
+                    "i": call_id,
+                },
+            )
+            await self._append_step(
+                s=s,
+                org_id=org_id,
+                run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="tool_result",
+                status="ok" if result.ok else "failed",
+                input_data={"tool": tool.key},
+                output_data=redact(result.output) if result.ok else {},
+                error=(
+                    redact(_error_dict(result.error)) if result.error else None
+                ),
+            )
+            await s.execute(
+                text(
+                    "UPDATE agent_runs SET tool_call_count = tool_call_count + 1 "
+                    "WHERE id = :i"
+                ),
+                {"i": run_id},
+            )
+            # Update messages to include the tool result turn
+            ctx_row = (
+                await s.execute(
+                    text("SELECT messages FROM run_context WHERE execution_id = :e"),
+                    {"e": run_id},
+                )
+            ).mappings().first()
+            if ctx_row is not None:
+                messages = list(ctx_row["messages"] or [])
+                messages.append(
+                    {
+                        "role": "tool",
+                        "content": (
+                            _jsonb(result.output) if result.ok
+                            else _jsonb(_error_dict(result.error))
+                        ),
+                        "tool_call_id": proposed_input.get("call_id"),
+                        "name": tool.key,
+                    }
+                )
+                await s.execute(
+                    text(
+                        "UPDATE run_context SET messages = CAST(:m AS jsonb), "
+                        "updated_at = now() WHERE execution_id = :e"
+                    ),
+                    {"m": _jsonb(messages), "e": run_id},
+                )
+            # Post-check exception escalation for external/irreversible
+            if post_check_exc is not None and tool.risk_class in (
+                "external_communication", "irreversible_write"
+            ):
+                esc_id = await self._write_escalation(
+                    s=s,
+                    org_id=org_id,
+                    run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="verification_error",
+                    context={
+                        "tool_call_id": call_id,
+                        "error_type": type(post_check_exc).__name__,
+                    },
+                    tool_call_id=call_id,
+                )
+                await self._write_terminated(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="escalated",
+                    detail={
+                        "reason": "verification_error",
+                        "escalation_id": esc_id,
+                    },
+                )
+    async def _step_verifying(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        epoch: int,
+        agent_version_id: str,
+        config: AgentConfig,
+        nudge: bool,
+    ) -> TerminalReason | None:
+        """Final outcome check. Writes terminated(completed) or escalates."""
+        async with tenant_session(org_id) as s:
+            await self._fence_and_heartbeat(s=s, run_id=run_id, epoch=epoch)
+            expected = config.expected_terminal_tool
+            satisfied = False
+            if expected is not None:
+                row = (
+                    await s.execute(
+                        text(
+                            "SELECT status, verified FROM tool_calls "
+                            "WHERE execution_id = :e AND tool_key_snapshot = :k "
+                            "ORDER BY started_at DESC LIMIT 1"
+                        ),
+                        {"e": run_id, "k": expected},
+                    )
+                ).mappings().first()
+                if row is not None and row["status"] == "completed":
+                    if not config.require_verified_terminal or row["verified"] is True:
+                        satisfied = True
+            if expected is not None and not satisfied:
+                await self._append_step(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    step_type="verified", status="failed",
+                    input_data={"expected": expected, "satisfied": False},
+                )
+                esc_id = await self._write_escalation(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="expected_tool_not_executed",
+                    context={"expected_tool": expected},
+                )
+                await self._write_terminated(
+                    s=s, org_id=org_id, run_id=run_id,
+                    agent_version_id=agent_version_id,
+                    reason="escalated",
+                    detail={
+                        "reason": "expected_tool_not_executed",
+                        "escalation_id": esc_id,
+                    },
+                )
+                return "escalated"
+            await self._append_step(
+                s=s, org_id=org_id, run_id=run_id,
+                agent_version_id=agent_version_id,
+                step_type="verified", status="ok",
+                input_data={"expected": expected, "satisfied": satisfied},
+            )
+            await self._write_terminated(
+                s=s, org_id=org_id, run_id=run_id,
+                agent_version_id=agent_version_id,
+                reason="completed",
+            )
+            return "completed"
+@dataclass(frozen=True)
+class _LoadedState:
+    steps: tuple[Any, ...]
+    counters: dict[str, Any]
+    consecutive_rejections: int
+    nudge_issued: bool
+    config: AgentConfig
+    terminal_tool_status: TerminalToolStatus
+    pending_proposal_count: int
+    last_step_type: str | None
+    agent_version_id: str
+    version: int
+    status: str
+__all__ = ["RuntimeEngine"]
+def _error_dict(exc: BaseException | None) -> dict[str, Any]:
+    if exc is None:
+        return {}
+    return {
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
+
+
+
+===== 9. DECISION =====
+
+
+--- file ---
+
+"""The runtime decision function: pure, testable, no I/O.
+
+decide_next_step() reads a frozen _RunState (loaded by the loop just before
+calling) and returns a StepDecision. It never touches the DB, never calls
+an LLM, never runs a tool. All it does is reason about what the run should
+do next given (steps, counters, config, tri-state terminal-tool status).
+
+Precedence rules (in order):
+  1. Budget limits beat any pending work (budget_exceeded / timed_out).
+  2. Consecutive-rejection cap beats any pending proposal.
+  3. Terminal-tool obligation beats content-only completion.
+  4. Otherwise, drive the normal cycle (reasoning -> proposals -> tool -> reasoning -> verifying).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Mapping, Sequence
+
+from app.adapters.llm.base import ToolCall
+from app.modules.agents.schemas import AgentConfig
+from app.modules.runtime.types import (
+    StepDecision,
+    TerminalToolStatus,
+    ESCALATION_REASON_REJECTION_CAP,
+)
+
+
+@dataclass(frozen=True)
+class RunState:
+    """Frozen snapshot the loop hands to decide_next_step.
+
+    Every field is read-only once constructed. The loop builds this from
+    a single short DB read before every iteration.
+    """
+    steps: tuple[Mapping[str, Any], ...]       # execution_steps, ordered by seq
+    iteration_count: int
+    tool_call_count: int
+    cost_usd: float
+    elapsed_seconds: float
+    consecutive_rejections: int
+    nudge_issued: bool
+    config: AgentConfig
+    terminal_tool_status: TerminalToolStatus
+    pending_proposal_count: int = 0             # unprocessed proposals from last llm_response
+    last_step_type: str | None = None           # convenience for the common read
+
+
+def decide_next_step(state: RunState) -> StepDecision:
+    """Pure: state in, decision out. No side effects."""
+
+    # --- Precedence 1: budget and time beat everything else -------------
+    if state.elapsed_seconds > state.config.limits.max_seconds:
+        return StepDecision(kind="terminate", terminal_reason="timed_out")
+    if state.iteration_count > state.config.limits.max_steps:
+        return StepDecision(kind="terminate", terminal_reason="budget_exceeded")
+    if state.tool_call_count > state.config.limits.max_tool_calls:
+        return StepDecision(kind="terminate", terminal_reason="budget_exceeded")
+    if state.cost_usd > float(state.config.limits.max_cost_usd):
+        return StepDecision(kind="terminate", terminal_reason="budget_exceeded")
+
+    # --- Precedence 2: repeated rejections ------------------------------
+    if state.consecutive_rejections >= 3:
+        return StepDecision(
+            kind="terminate",
+            terminal_reason="escalated",
+            escalation_reason=ESCALATION_REASON_REJECTION_CAP,
+        )
+
+    # --- Precedence 3: terminal-tool obligation -------------------------
+    expected = state.config.expected_terminal_tool
+    if expected is not None:
+        status = state.terminal_tool_status
+        if status == "ran_ok_verified":
+            # Requirement satisfied; verify final and terminate.
+            return StepDecision(kind="verifying", post_nudge=state.nudge_issued)
+        if status == "ran_ok_unverified":
+            # Tool ran but verification did not confirm. If policy requires
+            # verification for this risk class, escalate; otherwise verify.
+            if state.config.require_verified_terminal:
+                return StepDecision(
+                    kind="terminate",
+                    terminal_reason="escalated",
+                    escalation_reason="unverified_terminal_tool",
+                )
+            return StepDecision(kind="verifying", post_nudge=state.nudge_issued)
+        if status == "ran_failed":
+            return StepDecision(kind="terminate", terminal_reason="failed")
+        # status == "not_run": nudge once, then escalate.
+        if not state.nudge_issued:
+            # If a content-only response just arrived, do one more reasoning
+            # turn with a system nudge appended (the loop handles nudge write).
+            if state.last_step_type == "llm_response" and state.pending_proposal_count == 0:
+                return StepDecision(kind="reasoning")
+            # Otherwise keep going through the normal cycle.
+            return StepDecision(kind=_next_normal(state))
+        # Nudge already spent, still not run.
+        return StepDecision(
+            kind="terminate",
+            terminal_reason="escalated",
+            escalation_reason="expected_tool_not_executed",
+        )
+
+    # --- Precedence 4: normal cycle -------------------------------------
+    return StepDecision(kind=_next_normal(state))
+
+
+def _next_normal(state: RunState) -> str:
+    """What to do next when no terminal obligation and no limit hit."""
+    last = state.last_step_type
+
+    # No steps yet: begin with reasoning.
+    if last is None:
+        return "reasoning"
+
+    # Just finished an LLM call: either propose policy checks or (if no tool
+    # calls) end. If content-only and no expected terminal tool, terminate
+    # as completed below; if expected tool exists, the obligation block above
+    # already returned.
+    if last == "llm_response":
+        if state.pending_proposal_count > 0:
+            return "policy_check"
+        # Content-only response with no expected-tool obligation:
+        return "verifying"
+
+    # A tool result is in: decide whether to loop back to reasoning or
+    # verify. If we have any proposals still unprocessed, keep going.
+    if last == "tool_result":
+        return "reasoning"
+
+    # After tool_proposed step (policy check ran, next step is tool_call):
+    if last == "tool_proposed":
+        return "tool_call"
+
+    # After tool_rejected: loop back to reasoning with the rejection recorded.
+    if last == "tool_rejected":
+        return "reasoning"
+
+    # After a resumed/loaded_config step: reasoning.
+    if last in ("resumed", "loaded_config"):
+        return "reasoning"
+
+    # Fallback: keep reasoning. This should not trigger if the state machine
+    # is correct, but returning "reasoning" is safe (worst case: extra loop).
+    return "reasoning"
+
+
+__all__ = ["RunState", "decide_next_step"]
+
+
+
+===== 10. REGISTRY =====
+
+
+--- file ---
+
+"""Concrete tool registry: maps tool keys to executors and post-checks.
+
+This is the bridge between the engine's protocol (ToolRegistry) and actual
+tool implementations. It validates inputs against schemas before execution
+and enforces the security boundary.
+"""
+
+from __future__ import annotations
+
+import jsonschema
+from typing import Any
+
+from app.modules.runtime.types import (
+    ToolExecutor,
+    PostCheckFn,
+    EngineError,
+)
+
+
+class ConcreteToolRegistry:
+    """Registry that maps tool keys to executor functions and optional post-checks.
+    
+    Tools are registered at startup. The engine calls executor_for() and
+    post_check_for() during execution. Input validation happens here,
+    before any executor runs.
+    """
+
+    def __init__(self) -> None:
+        self._executors: dict[str, ToolExecutor] = {}
+        self._post_checks: dict[str, PostCheckFn] = {}
+        self._schemas: dict[str, dict[str, Any]] = {}
+
+    def register(
+        self,
+        *,
+        tool_key: str,
+        executor: ToolExecutor,
+        input_schema: dict[str, Any] | None = None,
+        post_check: PostCheckFn | None = None,
+    ) -> None:
+        """Register a tool executor and optional post-check.
+        
+        Args:
+            tool_key: Unique identifier for the tool (matches tools.key in DB)
+            executor: Async function that executes the tool
+            input_schema: JSON Schema for validating tool arguments
+            post_check: Optional async function to verify outcomes
+        """
+        self._executors[tool_key] = executor
+        self._schemas[tool_key] = input_schema or {}
+        if post_check is not None:
+            self._post_checks[tool_key] = post_check
+
+    def executor_for(self, tool_key: str) -> ToolExecutor:
+        """Return the executor for a tool key. Raises if not registered."""
+        executor = self._executors.get(tool_key)
+        if executor is None:
+            raise EngineError(f"tool {tool_key!r} not registered")
+        return executor
+
+    def post_check_for(self, tool_key: str) -> PostCheckFn | None:
+        """Return the post-check for a tool key, or None if not defined."""
+        return self._post_checks.get(tool_key)
+
+    def validate_input(self, tool_key: str, arguments: dict[str, Any]) -> None:
+        """Validate tool arguments against the registered schema.
+        
+        Raises EngineError if validation fails. This is called by the engine
+        before execution to enforce the security boundary.
+        """
+        schema = self._schemas.get(tool_key)
+        if schema is None:
+            return  # No schema = no validation (permissive for MVP)
+        
+        try:
+            jsonschema.validate(instance=arguments, schema=schema)
+        except jsonschema.ValidationError as exc:
+            raise EngineError(
+                f"tool {tool_key!r} input validation failed: {exc.message}"
+            ) from exc
+
+
+# Singleton registry instance (initialized at app startup)
+_tool_registry = ConcreteToolRegistry()
+
+
+def get_tool_registry() -> ConcreteToolRegistry:
+    """Return the global tool registry instance."""
+    return _tool_registry
+
+
+
+===== 11. DEPS =====
+
+
+--- file ---
+
+"""Shared FastAPI dependencies.
+
+tenant_context() is the ONLY sanctioned way for a route to obtain an
+AsyncSession bound to a tenant. It depends on the authenticated user and
+org membership (Milestone 2 wires auth); today it is present but unused.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from typing import Annotated
+
+from fastapi import Depends, Header, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db import get_sessionmaker
+
+
+async def db_session() -> AsyncIterator[AsyncSession]:
+    """Unscoped session for endpoints that do NOT touch tenant data (e.g., health).
+
+    Any endpoint that reads or writes tenant-owned tables MUST use
+    tenant_context() from app.core.db instead of this.
+    """
+    sm = get_sessionmaker()
+    async with sm() as session:
+        yield session
+
+
+async def request_id_header(
+    x_request_id: Annotated[str | None, Header(alias="X-Request-ID")] = None,
+) -> str | None:
+    """Pass through a caller-supplied request ID; validated in middleware."""
+    return x_request_id
+
+
+
+===== 12. CONFIG =====
+
+
+--- file ---
+
+"""Centralized runtime configuration for Auralink.
+
+All settings are loaded once at import and cached by ``get_settings()``.
+No module should read ``os.environ`` directly â€” everything goes through here
+so that validation, secret masking, and env-specific behavior stay consistent.
+
+Design notes (see docs/adr/):
+- Required secrets have no defaults: missing config fails fast at boot
+  (ADR-0002 tenant isolation, ADR-0008 auth).
+- DATABASE_URL scheme is validated to be the async driver. Mixing a sync URL
+  into an async engine is a common prod incident; we reject it at startup.
+- LLM_* fields are optional now and become required in Milestone 2 when the
+  provider adapter lands (ADR-0003).
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import Literal
+from urllib.parse import urlparse
+
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+Environment = Literal["dev", "staging", "prod"]
+
+
+class Settings(BaseSettings):
+    """Typed, validated application configuration."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",
+    )
+
+    # --- Application ------------------------------------------------------
+    APP_NAME: str = "auralink"
+    APP_ENV: Environment = "dev"
+    APP_VERSION: str = "0.1.0"
+    API_V1_PREFIX: str = "/api/v1"
+    LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+
+    # --- Networking -------------------------------------------------------
+    # Comma-separated list. Wildcard '*' is rejected outside dev.
+    CORS_ORIGINS: str = "http://localhost:5173"
+    TRUSTED_HOSTS: str = "localhost,127.0.0.1"
+
+    # --- Database ---------------------------------------------------------
+    # Must use the asyncpg driver; enforced below.
+    DATABASE_URL: str = Field(..., min_length=1)
+    DATABASE_POOL_SIZE: int = 10
+    DATABASE_POOL_MAX_OVERFLOW: int = 5
+    DATABASE_STATEMENT_TIMEOUT_MS: int = 15_000
+    # Owner-role URL used by Alembic and admin_session(). Same scheme rules.
+    ALEMBIC_DATABASE_URL: str = Field(..., min_length=1)
+
+    # --- Auth / Sessions --------------------------------------------------
+    # HS256 secrets must be at least 32 bytes of entropy (we hash a passphrase
+    # upstream if the operator provides something shorter â€” see SECURITY.md).
+    JWT_SECRET: SecretStr = Field(..., min_length=32)
+    JWT_ALGORITHM: Literal["HS256", "HS384", "HS512"] = "HS256"
+    ACCESS_TOKEN_TTL_SECONDS: int = 15 * 60
+    REFRESH_TOKEN_TTL_SECONDS: int = 30 * 24 * 60 * 60
+    ARGON2_TIME_COST: int = 3
+    ARGON2_MEMORY_COST_KIB: int = 65_536  # 64 MiB
+    ARGON2_PARALLELISM: int = 2
+
+    # --- Rate limits / quotas (MVP defaults; per-org overrides later) -----
+    RL_DEFAULT_PER_MINUTE: int = 120
+    RL_AUTH_PER_MINUTE: int = 20
+    RL_CHANNEL_PER_MINUTE: int = 600
+
+    # --- LLM (optional at File 2; required from Milestone 2) --------------
+    LLM_PROVIDER: Literal["openai", "azure-openai", "vllm"] | None = None
+    LLM_API_KEY: SecretStr | None = None
+    LLM_BASE_URL: str | None = None
+    LLM_MODEL: str | None = None
+    LLM_REQUEST_TIMEOUT_SECONDS: int = 60
+    LLM_DEFAULT_MAX_OUTPUT_TOKENS: int = 1_024
+
+    # --- Observability ----------------------------------------------------
+    METRICS_ENABLED: bool = True
+    LOG_JSON: bool = True
+
+    # --- Validators -------------------------------------------------------
+
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def _require_async_postgres(cls, v: str) -> str:
+        parsed = urlparse(v)
+        if parsed.scheme != "postgresql+asyncpg":
+            raise ValueError(
+                "DATABASE_URL must use scheme 'postgresql+asyncpg://'. "
+                "Got scheme '" + (parsed.scheme or "<empty>") + "'. "
+                "Sync drivers belong in Alembic only; set ALEMBIC_DATABASE_URL separately."
+            )
+        if not parsed.hostname:
+            raise ValueError("DATABASE_URL is missing a hostname.")
+        return v
+
+    @field_validator("CORS_ORIGINS")
+    @classmethod
+    def _validate_cors(cls, v: str) -> str:
+        parts = [p.strip() for p in v.split(",") if p.strip()]
+        if not parts:
+            raise ValueError("CORS_ORIGINS must contain at least one origin.")
+        return ",".join(parts)
+
+    @model_validator(mode="after")
+    def _env_specific_rules(self) -> "Settings":
+        origins = self.cors_origins_list
+        if self.APP_ENV in ("staging", "prod"):
+            if any(o == "*" for o in origins):
+                raise ValueError(
+                    "CORS_ORIGINS must not contain '*' outside dev. "
+                    "Set explicit origins per environment."
+                )
+            if any(o.startswith("http://localhost") for o in origins):
+                raise ValueError(
+                    "CORS_ORIGINS must not include localhost outside dev."
+                )
+        return self
+
+    # --- Derived helpers --------------------------------------------------
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        return [p.strip() for p in self.CORS_ORIGINS.split(",") if p.strip()]
+
+    @property
+    def trusted_hosts_list(self) -> list[str]:
+        return [p.strip() for p in self.TRUSTED_HOSTS.split(",") if p.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        return self.APP_ENV == "prod"
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Return the process-wide settings singleton.
+
+    Cached so FastAPI dependencies and workers share one instance. Tests that
+    need different config should set env vars before first call, or use
+    ``get_settings.cache_clear()`` explicitly.
+    """
+    return Settings()  # type: ignore[call-arg]
+
+
+===== 13. DB =====
+
+
+--- file ---
+
+"""Database engine, session factory, and RLS enforcement.
+
+Two engines:
+- get_engine()/get_sessionmaker()             -> runtime role (auralink_app), RLS-enforced.
+- get_owner_engine()/get_owner_sessionmaker() -> owner role (auralink), for
+  migrations and admin_session() only.
+
+See ADR-0002.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from app.core.config import get_settings
+from app.core.logging import get_logger
+
+log = get_logger(__name__)
+
+
+_engine: AsyncEngine | None = None
+_sessionmaker: async_sessionmaker[AsyncSession] | None = None
+_owner_engine: AsyncEngine | None = None
+_owner_sessionmaker: async_sessionmaker[AsyncSession] | None = None
+
+
+def get_engine() -> AsyncEngine:
+    global _engine
+    if _engine is None:
+        s = get_settings()
+        _engine = create_async_engine(
+            s.DATABASE_URL,
+            pool_size=s.DATABASE_POOL_SIZE,
+            max_overflow=s.DATABASE_POOL_MAX_OVERFLOW,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            future=True,
+            connect_args={
+                "server_settings": {
+                    "application_name": "auralink_app",
+                    "statement_timeout": str(s.DATABASE_STATEMENT_TIMEOUT_MS),
+                },
+            },
+        )
+    return _engine
+
+
+def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
+    global _sessionmaker
+    if _sessionmaker is None:
+        _sessionmaker = async_sessionmaker(
+            bind=get_engine(),
+            expire_on_commit=False,
+            autoflush=False,
+        )
+    return _sessionmaker
+
+
+def get_owner_engine() -> AsyncEngine:
+    global _owner_engine
+    if _owner_engine is None:
+        s = get_settings()
+        _owner_engine = create_async_engine(
+            s.ALEMBIC_DATABASE_URL,
+            pool_size=5,
+            max_overflow=2,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            future=True,
+            connect_args={
+                "server_settings": {
+                    "application_name": "auralink_owner",
+                    "statement_timeout": str(s.DATABASE_STATEMENT_TIMEOUT_MS),
+                },
+            },
+        )
+    return _owner_engine
+
+
+def get_owner_sessionmaker() -> async_sessionmaker[AsyncSession]:
+    global _owner_sessionmaker
+    if _owner_sessionmaker is None:
+        _owner_sessionmaker = async_sessionmaker(
+            bind=get_owner_engine(),
+            expire_on_commit=False,
+            autoflush=False,
+        )
+    return _owner_sessionmaker
+
+
+async def dispose_engine() -> None:
+    """Call from application shutdown."""
+    global _engine, _sessionmaker, _owner_engine, _owner_sessionmaker
+    if _engine is not None:
+        await _engine.dispose()
+    if _owner_engine is not None:
+        await _owner_engine.dispose()
+    _engine = None
+    _sessionmaker = None
+    _owner_engine = None
+    _owner_sessionmaker = None
+
+
+@contextlib.asynccontextmanager
+async def tenant_session(org_id: uuid.UUID | str) -> AsyncIterator[AsyncSession]:
+    """Yield a session scoped to one org via set_config.'app.org_id'.'
+
+    Transaction-local setting, so pooled connections cannot leak tenant context.
+    Fails closed: no org_id -> raise.
+    """
+    if not org_id:
+        raise ValueError("tenant_session requires an org_id")
+    org_str = str(org_id)
+    sm = get_sessionmaker()
+    async with sm() as session:
+        async with session.begin():
+            await session.execute(
+                text("SELECT set_config('app.org_id', :oid, true)"),
+                {"oid": org_str},
+            )
+            yield session
+
+
+@contextlib.asynccontextmanager
+async def admin_session() -> AsyncIterator[AsyncSession]:
+    """Owner-role session for migrations/maintenance. RLS bypassed; audit required."""
+    sm = get_owner_sessionmaker()
+    async with sm() as session:
+        async with session.begin():
+            yield session
+
+
+async def healthcheck() -> dict[str, Any]:
+    """Lightweight DB check for /healthz. Never sets tenant context."""
+    try:
+        sm = get_sessionmaker()
+        async with sm() as session:
+            await session.execute(text("SELECT 1"))
+        return {"db": "ok"}
+    except Exception as exc:
+        log.error("db_healthcheck_failed", extra={"error": str(exc)})
+        return {"db": "error"}
+
+
+
+===== 14. MAIN =====
+
+
+--- file ---
+
+"""Auralink FastAPI application.
+
+Wires logging, request-ID middleware, CORS, and the v1 router.
+Call site for uvicorn:
+    uvicorn app.main:app --reload
+"""
+
+from __future__ import annotations
+
+import time
+import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from app.api.v1.health import router as health_router
+from app.core import logging as alog
+from app.core.config import get_settings
+from app.core.db import dispose_engine
+from app.modules.tools.echo import register_echo_tool
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Startup: configure logging. Shutdown: dispose DB engine."""
+    alog.configure_logging()
+    log = alog.get_logger("app.startup")
+    s = get_settings()
+    log.info("app_started", extra={"env": s.APP_ENV, "version": s.APP_VERSION})
+    register_echo_tool()
+    log.info("tool_registry_initialized", extra={"tools": ["echo"]})
+    try:
+        yield
+    finally:
+        await dispose_engine()
+        log.info("app_stopped")
+
+
+def _is_safe_id(value: str | None) -> bool:
+    """Accept caller-supplied request IDs only if they look like hex/base36 tokens."""
+    if not value or len(value) > 128:
+        return False
+    return all(c.isalnum() or c in "-_" for c in value)
+
+
+def create_app() -> FastAPI:
+    s = get_settings()
+    app = FastAPI(
+        title="Auralink",
+        version=s.APP_VERSION,
+        lifespan=lifespan,
+        docs_url=None if s.is_production else "/docs",
+        redoc_url=None if s.is_production else "/redoc",
+        openapi_url=None if s.is_production else "/openapi.json",
+    )
+
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=s.trusted_hosts_list)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=s.cors_origins_list,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["X-Request-ID", "X-Trace-ID"],
+    )
+
+    @app.middleware("http")
+    async def request_context_middleware(request: Request, call_next):
+        incoming = request.headers.get("x-request-id")
+        request_id = incoming if _is_safe_id(incoming) else uuid.uuid4().hex
+        trace_id = uuid.uuid4().hex
+        alog.bind_context(request_id=request_id, trace_id=trace_id)
+        start = time.perf_counter()
+        response: Response | None = None
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            alog.log_exception(alog.get_logger("app.request"), exc, ctx={"path": request.url.path})
+            raise
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            alog.get_logger("app.request").info(
+                "request",
+                extra={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code if response is not None else 500,
+                    "duration_ms": round(duration_ms, 2),
+                },
+            )
+            alog.clear_context()
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Trace-ID"] = trace_id
+        return response
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        alog.log_exception(alog.get_logger("app.unhandled"), exc, ctx={"path": request.url.path})
+        return JSONResponse(status_code=500, content={"error": "internal_error"})
+
+    app.include_router(health_router, prefix=s.API_V1_PREFIX)
+    return app
+
+
+app = create_app()
+
+
+
+===== 15. AUTH GREP =====
+
+
+--- grep ---
+
+
+app\adapters\llm\base.py:25:Role = 
+Literal["system", "user", "assistant", 
+"tool"]
+app\adapters\llm\base.py:66:    role: 
+Role
+app\adapters\llm\base.py:70:    # 
+Populated for role="tool" turns 
+responding to a specific tool call.
+app\adapters\llm\base.py:72:    name: 
+str | None = None  # for role="tool", 
+the tool name
+app\adapters\llm\openai_compat.py:58:    
+openai.PermissionDeniedError,
+app\adapters\llm\openai_compat.py:162:   
+     msg: dict[str, Any] = {"role": 
+m.role}
+app\core\config.py:57:    # Owner-role 
+URL used by Alembic and admin_session(). 
+Same scheme rules.
+app\core\db.py:4:- 
+get_engine()/get_sessionmaker()          
+   -> runtime role (auralink_app), 
+RLS-enforced.
+app\core\db.py:5:- get_owner_engine()/get
+_owner_sessionmaker() -> owner role 
+(auralink), for
+app\core\db.py:137:    """Owner-role 
+session for migrations/maintenance. RLS 
+bypassed; audit required."""
+app\modules\runtime\engine.py:849:       
+         messages.append({"role": 
+"system", "content": 
+config.instructions})
+app\modules\runtime\engine.py:861:       
+         messages.append({"role": 
+"user", "content": task})
+app\modules\runtime\engine.py:864:       
+             "role": "system",
+app\modules\runtime\engine.py:875:       
+             role=m["role"],
+app\modules\runtime\engine.py:974:       
+             "role": "assistant",
+app\modules\runtime\engine.py:1069:      
+              role_tool_message="Tool 
+not available.",
+app\modules\runtime\engine.py:1084:      
+              role_tool_message=(
+app\modules\runtime\engine.py:1145:      
+  role_tool_message: str | None = None,
+app\modules\runtime\engine.py:1148:      
+  append a role=tool message to 
+run_context.messages so the model
+app\modules\runtime\engine.py:1168:      
+  if role_tool_message is not None:
+app\modules\runtime\engine.py:1170:      
+          "role": "tool",
+app\modules\runtime\engine.py:1173:      
+          "content": role_tool_message,
+app\modules\runtime\engine.py:1195:      
+  No str(exc), no role=tool message, no 
+consecutive_rejections bump."""
+app\modules\runtime\engine.py:1461:      
+                  "role": "tool",
+migrations\versions\0001_initial.py:11:  
+the owner role would otherwise bypass 
+RLS.
+migrations\versions\0001_initial.py:166: 
+   # --- Grants to runtime role 
+----------------------------------------
+migrations\versions\0003_run_context.py:1
+03:    # DELETE intentionally withheld 
+from auralink_app -- only maintenance 
+role.
+migrations\versions\0004_run_context_mess
+ages.py:12:Shape: JSONB array of {role, 
+content, tool_calls?, tool_call_id?, 
+name?}.
+migrations\env.py:3:Loads the OWNER-role 
+URL from Settings.ALEMBIC_DATABASE_URL, 
+not the runtime
+migrations\env.py:5:not as the 
+RLS-enforced runtime role. See ADR-0017.
+migrations\env.py:35:    """Owner-role 
+URL from Settings. Imported lazily so 
+offline mode works."""
+tests\db\test_tenant_isolation.py:67:asyn
+c def test_runtime_role_cannot_delete_too
+l_calls(world):
+tests\db\test_tenant_isolation.py:68:    
+with pytest.raises(DBAPIError, 
+match="permission denied"):
+_patch_backup_20261123_233106\engine.py:8
+72:                
+messages.append({"role": "system", 
+"content": config.instructions})
+_patch_backup_20261123_233106\engine.py:8
+76:                    "role": "system",
+_patch_backup_20261123_233106\engine.py:8
+88:                    role=m["role"],
+_patch_backup_20261123_233106\engine.py:9
+94:                    "role": 
+"assistant",
+_patch_backup_20261123_233106\engine.py:1
+313:                        "role": 
+"tool",
+_patch_backup_20261123_235143\engine.py:8
+90:                
+messages.append({"role": "system", 
+"content": config.instructions})
+_patch_backup_20261123_235143\engine.py:8
+94:                    "role": "system",
+
+
+
+
+===== 16. AUDIT GREP =====
+
+
+--- grep ---
+
+
+
+===== 17. FRONTEND =====
+
+
+--- check ---
+
+
+Name              
+----              
+node_modules      
+public            
+src               
+.gitignore        
+.oxlintrc.json    
+index.html        
+package-lock.json 
+package.json      
+README.md         
+tsconfig.app.json 
+tsconfig.json     
+tsconfig.node.json
+vite.config.ts    
+
+
+
+
+===== 18. RUNCTX CAP =====
+
+
+--- grep ---
+
+
+
+===== 19. TTL =====
+
+
+--- grep ---
+
+
+app\core\config.py:65:    
+ACCESS_TOKEN_TTL_SECONDS: int = 15 * 60
+app\core\config.py:66:    
+REFRESH_TOKEN_TTL_SECONDS: int = 30 * 24 
+* 60 * 60
+app\modules\runtime\engine.py:74:        
+                "SELECT status, 
+lease_holder, lease_expires_at, 
+lease_epoch "
+app\modules\runtime\engine.py:90:        
+        and row["lease_expires_at"] is 
+not None
+app\modules\runtime\engine.py:91:        
+        and row["lease_expires_at"] > now
+app\modules\runtime\engine.py:96:        
+            + " until " + 
+str(row["lease_expires_at"])
+app\modules\runtime\engine.py:103:       
+             "    lease_expires_at = 
+now() + make_interval(secs => :ttl), "
+app\modules\runtime\engine.py:108:       
+         {"h": holder, "e": new_epoch, 
+"ttl": self._config.lease_ttl_seconds, 
+"i": run_id},
+app\modules\runtime\engine.py:119:       
+         "    lease_expires_at = now() + 
+make_interval(secs => :ttl) "
+app\modules\runtime\engine.py:123:       
+     {"ttl": 
+self._config.lease_ttl_seconds, "i": 
+run_id, "e": epoch},
+app\modules\runtime\engine.py:135:       
+             "UPDATE agent_runs SET 
+lease_holder = NULL, lease_expires_at = 
+NULL "
+app\modules\runtime\engine.py:277:       
+         "    lease_holder = NULL, 
+lease_expires_at = NULL, "
+app\modules\runtime\types.py:118:    
+lease_ttl_seconds: int
+app\modules\runtime\types.py:129:        
+if self.heartbeat_interval_seconds * 3 > 
+self.lease_ttl_seconds:
+app\modules\runtime\types.py:131:        
+        "heartbeat_interval_seconds * 3 
+must be <= lease_ttl_seconds "
+app\modules\runtime\types.py:132:        
+        "(need three heartbeats per TTL 
+for safe detection)"
+app\modules\runtime\types.py:146:def comp
+ute_lease_ttl(max_tool_timeout_seconds: 
+float) -> int:
+app\modules\runtime\types.py:147:    
+"""Lease TTL must exceed max tool 
+timeout by a safety margin."""
+app\modules\runtime\types.py:223:    
+"compute_lease_ttl",
+migrations\versions\0002_runtime.py:24:- 
+agent_runs gains lease columns (holder, 
+expires_at, heartbeat_at, epoch).
+
+
+
+
+===== 20. SMOKE =====
+
+
+--- file ---
+
+"""Smoke test for the runtime engine and tool registry."""
+import sys
+sys.path.insert(0, ".")
+
+from app.modules.tools.echo import register_echo_tool
+from app.modules.runtime.registry import get_tool_registry
+from app.modules.runtime.decision import decide_next_step, RunState
+from app.modules.agents.schemas import AgentConfig, AgentLimits
+
+def main():
+    print("1. Registering tools...")
+    register_echo_tool()
+    
+    print("2. Fetching registry and executor...")
+    registry = get_tool_registry()
+    executor = registry.executor_for("echo")
+    print(f"   -> Executor found: {executor.__name__}")
+    
+    print("3. Validating input schema...")
+    registry.validate_input("echo", {"message": "hello auralink"})
+    print("   -> Validation passed!")
+    
+    print("4. Testing pure decision logic (initial state)...")
+    limits = AgentLimits(max_steps=10, max_tool_calls=5, max_seconds=60, max_cost_usd=1.0)
+    config = AgentConfig(
+        instructions="You are a helpful assistant.",
+        model="gpt-4o-mini",
+        limits=limits,
+        expected_terminal_tool=None,
+        require_verified_terminal=False
+    )
+    
+    state = RunState(
+        steps=(),
+        iteration_count=0,
+        tool_call_count=0,
+        cost_usd=0.0,
+        elapsed_seconds=0.0,
+        consecutive_rejections=0,
+        nudge_issued=False,
+        config=config,
+        terminal_tool_status="not_run",
+        pending_proposal_count=0,
+        last_step_type=None
+    )
+    
+    decision = decide_next_step(state)
+    print(f"   -> Decision: kind='{decision.kind}'")
+    
+    print("\n✅ Smoke test PASSED! Engine components are wired correctly.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== 21. AGENT MODELS =====
+
+
+--- file ---
+
+"""SQLAlchemy models for the agent engine (Milestone 2 first slice).
+
+Design notes:
+- All primary keys are UUIDv7 strings (app-generated via app.core.ids). The
+  Postgres column type is VARCHAR(36), not UUID, because app.org_id GUC is set
+  as text and comparisons against a uuid column would need casts. Trade-off:
+  36 bytes per PK vs 16; irrelevant at our scale, and it removes a class of
+  type-cast surprises in RLS policies.
+- agent_versions are immutable: no updated_at. Service layer refuses UPDATE.
+- Agent configuration is JSONB. Pydantic validates at the service boundary;
+  the DB stores it opaquely.
+- agent_runs is the first slice of the executions table in blueprint Â§11.2.
+  execution_steps and tool_calls land with the runtime state machine.
+- RLS is enforced in the Alembic migration, not in the model. Every table with
+  org_id gets ENABLE + FORCE ROW LEVEL SECURITY + policy using
+  current_setting('app.org_id'). A CI test enumerates tables and fails if any
+  is missing RLS.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    """Base for all ORM models. Metadata is shared so Alembic can autogenerate."""
+
+
+def _uuid7_pk() -> str:
+    # Local import to avoid a circular import at module load time.
+    from app.core.ids import uuid7str
+    return uuid7str()
+
+
+class Agent(Base):
+    __tablename__ = "agents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid7_pk)
+    org_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    current_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "name", name="uq_agents_org_name"),
+        Index("ix_agents_org_status", "org_id", "status"),
+    )
+
+
+class AgentVersion(Base):
+    """Immutable. A new version is created for every deploy; no UPDATEs."""
+
+    __tablename__ = "agent_versions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid7_pk)
+    agent_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    org_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("agent_id", "version", name="uq_agent_versions_agent_version"),
+        Index("ix_agent_versions_org_agent", "org_id", "agent_id"),
+    )
+
+
+class Tool(Base):
+    """Builtin tools have org_id NULL; per-org tools land later."""
+
+    __tablename__ = "tools"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid7_pk)
+    org_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    key: Mapped[str] = mapped_column(String(100), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    input_schema: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    output_schema: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    risk_class: Mapped[str] = mapped_column(String(32), nullable=False)
+    # read_only | reversible_write | irreversible_write | financial | external_communication
+    approval_policy: Mapped[str] = mapped_column(String(32), nullable=False, default="auto")
+    # auto | always | above_threshold
+    timeout_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=15000)
+    idempotency_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="keyed")
+    # none | keyed | tool_managed
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "key", name="uq_tools_org_key"),
+        Index("ix_tools_org_risk", "org_id", "risk_class"),
+    )
+
+
+class AgentToolGrant(Base):
+    """Per-version allowlist. Absence of a grant means the agent cannot call the tool."""
+
+    __tablename__ = "agent_tool_grants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid7_pk)
+    agent_version_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_versions.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    tool_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tools.id", ondelete="RESTRICT"), nullable=False, index=True,
+    )
+    org_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+    __table_args__ = (
+        UniqueConstraint("agent_version_id", "tool_id", name="uq_grants_version_tool"),
+    )
+
+
+class AgentRun(Base):
+    """First slice of executions. Runtime state machine extends this later."""
+
+    __tablename__ = "agent_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid7_pk)
+    org_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    agent_version_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=False, index=True,
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    # pending | running | completed | failed | escalated | cancelled | timed_out | budget_exceeded
+    terminal_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    output: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    iteration_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_call_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tokens_in: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cost_usd: Mapped[float] = mapped_column(Numeric(12, 6), nullable=False, default=0)
+
+    __table_args__ = (
+        Index("ix_agent_runs_org_status", "org_id", "status"),
+        Index("ix_agent_runs_org_started", "org_id", "started_at"),
+    )
+
+
+
+===== 22. REQS =====
+
+
+--- file ---
+
+alembic==1.14.0
+annotated-types==0.8.0
+anyio==4.16.0
+argon2-cffi==23.1.0
+argon2-cffi-bindings==26.2.0
+asyncpg==0.30.0
+attrs==26.1.0
+# Editable Git install with no remote (auralink-backend==0.1.0)
+-e c:\users\administrator\auralink\backend
+certifi==2026.11.20
+cffi==2.1.1
+click==8.5.1
+colorama==0.4.6
+distro==1.9.0
+fastapi==0.115.6
+greenlet==3.5.6
+grimp==3.20
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.9.0
+httpx==0.28.1
+idna==3.20
+import-linter==2.2
+iniconfig==2.3.1
+jiter==0.19.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+Mako==1.4.3
+MarkupSafe==3.0.4
+mypy==1.13.0
+mypy_extensions==1.2.0
+numpy==2.5.5
+openai==1.109.1
+packaging==26.3
+pgvector==0.3.6
+pluggy==1.7.0
+psycopg2-binary==2.9.10
+pycparser==3.12
+pydantic==2.10.4
+pydantic-settings==2.7.0
+pydantic_core==2.27.2
+PyJWT==2.10.1
+pytest==8.3.4
+pytest-asyncio==0.25.0
+python-dotenv==1.2.4
+python-multipart==0.0.20
+PyYAML==6.0.4
+referencing==0.37.0
+rpds-py==2026.9.1
+ruff==0.8.4
+setuptools==84.2.1
+sniffio==1.3.1
+SQLAlchemy==2.0.36
+starlette==0.41.3
+tqdm==4.70.1
+typing_extensions==4.16.0
+uvicorn==0.54.0
+watchfiles==1.3.0
+websockets==17.4
+wheel==0.48.0
+
+DONE

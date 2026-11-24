@@ -1,7 +1,7 @@
-"""Centralized runtime configuration for Auralink.
+﻿"""Centralized runtime configuration for Auralink.
 
 All settings are loaded once at import and cached by ``get_settings()``.
-No module should read ``os.environ`` directly — everything goes through here
+No module should read ``os.environ`` directly â€” everything goes through here
 so that validation, secret masking, and env-specific behavior stay consistent.
 
 Design notes (see docs/adr/):
@@ -59,7 +59,7 @@ class Settings(BaseSettings):
 
     # --- Auth / Sessions --------------------------------------------------
     # HS256 secrets must be at least 32 bytes of entropy (we hash a passphrase
-    # upstream if the operator provides something shorter — see SECURITY.md).
+    # upstream if the operator provides something shorter â€” see SECURITY.md).
     JWT_SECRET: SecretStr = Field(..., min_length=32)
     JWT_ALGORITHM: Literal["HS256", "HS384", "HS512"] = "HS256"
     ACCESS_TOKEN_TTL_SECONDS: int = 15 * 60
@@ -132,7 +132,12 @@ class Settings(BaseSettings):
 
     @property
     def trusted_hosts_list(self) -> list[str]:
-        return [p.strip() for p in self.TRUSTED_HOSTS.split(",") if p.strip()]
+        hosts = [p.strip() for p in self.TRUSTED_HOSTS.split(",") if p.strip()]
+        # TestClient sends Host: testserver. Allow it outside production so
+        # API tests can exercise the full middleware stack. Never in prod.
+        if not self.is_production and "testserver" not in hosts:
+            hosts.append("testserver")
+        return hosts
 
     @property
     def is_production(self) -> bool:
