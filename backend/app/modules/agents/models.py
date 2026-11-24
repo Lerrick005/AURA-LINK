@@ -181,11 +181,13 @@ class AgentRun(Base):
     cancelled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    workflow_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
     __table_args__ = (
         Index("ix_agent_runs_org_status", "org_id", "status"),
         Index("ix_agent_runs_org_started", "org_id", "started_at"),
     )
+
 
 
 
