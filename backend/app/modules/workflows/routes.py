@@ -1,4 +1,4 @@
-﻿"""HTTP routes for Workflow management and execution."""
+"""HTTP routes for Workflow management and execution."""
 from __future__ import annotations
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
@@ -15,10 +15,11 @@ from app.modules.workflows.api_schemas import (
 )
 from app.modules.workflows.runner import run_workflow_background
 from app.modules.workflows.service import (
+    DuplicateWorkflowName,
     InvalidWorkflowGraph,
     WorkflowNotFound,
+    create_deployed_workflow,
     create_version,
-    create_workflow,
     deploy_version,
     get_workflow,
     list_workflows,
@@ -34,15 +35,27 @@ async def api_create_workflow(
     body: WorkflowCreate,
     actor: Actor = Depends(current_actor),
 ) -> WorkflowResponse:
+    """Create a workflow.
+
+    If body.graph is provided, creates version 1 and deploys it.
+    If omitted, uses the default trigger->terminate starter graph and
+    deploys it. Either way the returned workflow has status='active' and
+    is immediately runnable via POST /workflows/{id}/runs.
+    """
     async with tenant_session(actor.org_id) as s:
         try:
-            wf = await create_workflow(
+            wf = await create_deployed_workflow(
                 s, org_id=actor.org_id,
                 name=body.name, description=body.description,
-                created_by=actor.user_id,
+                created_by=actor.user_id, graph=body.graph,
             )
-        except Exception as exc:
+        except DuplicateWorkflowName as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+        except InvalidWorkflowGraph as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "invalid_workflow_graph", "errors": exc.errors},
+            )
         await s.refresh(wf)
         return WorkflowResponse.model_validate(wf, from_attributes=True)
 
@@ -124,8 +137,7 @@ async def api_trigger_workflow(
 
     For MVP this uses FastAPI's BackgroundTasks (in-process). In production
     this should enqueue to a real worker (Celery/RQ) so API process restarts
-    do not orphan in-flight runs. That decision belongs with ADR-001's revisit
-    trigger for worker topology.
+    do not orphan in-flight runs.
     """
     org_id = actor.org_id
     async with tenant_session(org_id) as s:

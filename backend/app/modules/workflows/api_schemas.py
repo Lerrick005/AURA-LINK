@@ -1,4 +1,4 @@
-﻿"""Pydantic schemas for the Workflow REST API.
+"""Pydantic schemas for the Workflow REST API.
 
 These are HTTP-facing. They are distinct from `schemas.py` (which models the
 internal graph structure) and `models.py` (which models the database).
@@ -16,6 +16,14 @@ from app.modules.workflows.schemas import WorkflowGraph
 class WorkflowCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     description: str | None = None
+    graph: WorkflowGraph | None = Field(
+        default=None,
+        description=(
+            "Optional graph. If provided, creates version 1 and deploys it. "
+            "If omitted, a default trigger->terminate graph is used so the "
+            "workflow is immediately runnable from the UI."
+        ),
+    )
 
 
 class WorkflowVersionCreate(BaseModel):

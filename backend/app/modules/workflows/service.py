@@ -1,4 +1,4 @@
-﻿"""Workflow service: create, version, deploy, get, list.
+"""Workflow service: create, version, deploy, get, list.
 
 Every function takes an AsyncSession bound to a tenant via tenant_session().
 Callers control the transaction boundary. The service never commits.
@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.ids import uuid7str
 from app.modules.workflows.graph import validate_graph
 from app.modules.workflows.models import Workflow, WorkflowVersion
-from app.modules.workflows.schemas import WorkflowGraph
+from app.modules.workflows.schemas import Node, WorkflowGraph
 
 
 class WorkflowError(Exception):
@@ -216,14 +216,6 @@ async def resolve_runtime_graph(
     return wf, ver, graph
 
 
-__all__ = [
-    "WorkflowError", "WorkflowNotFound", "WorkflowVersionNotFound",
-    "DuplicateWorkflowName", "InvalidWorkflowGraph", "WorkflowNotDeployed",
-    "create_workflow", "create_version", "deploy_version",
-    "get_workflow", "list_workflows", "resolve_runtime_graph",
-    "start_workflow_run",
-]
-
 async def start_workflow_run(
     session: AsyncSession,
     *,
@@ -262,3 +254,61 @@ async def start_workflow_run(
     )
     await session.flush()
     return run_id
+
+
+# --- Starter graph + deployed-create --------------------------------
+
+_STARTER_GRAPH_NODES = [
+    {"id": "start", "type": "trigger", "next": "end"},
+    {"id": "end", "type": "terminate", "config": {"reason": "completed"}},
+]
+
+
+def default_starter_graph() -> WorkflowGraph:
+    """A trigger -> terminate graph. Runs, completes, does nothing.
+
+    Used when the UI creates a workflow without a graph. The workflow is
+    immediately runnable and produces a real agent_runs row + two
+    execution_steps rows, which is what proves the engine pipeline works.
+    """
+    return WorkflowGraph(
+        entry_node_id="start",
+        nodes=[Node.model_validate(n) for n in _STARTER_GRAPH_NODES],
+        edges=[("start", "end")],
+    )
+
+
+async def create_deployed_workflow(
+    session: AsyncSession, *, org_id: str, name: str,
+    description: str | None = None, created_by: str | None = None,
+    graph: WorkflowGraph | None = None,
+) -> Workflow:
+    """Create workflow, version 1, and deploy it — one transaction.
+
+    If graph is None, uses default_starter_graph() so the workflow is
+    immediately runnable. This is what the UI calls when the user clicks
+    "Create Workflow" without a graph editor.
+    """
+    wf = await create_workflow(
+        session, org_id=org_id, name=name,
+        description=description, created_by=created_by,
+    )
+    g = graph if graph is not None else default_starter_graph()
+    ver = await create_version(
+        session, org_id=org_id, workflow_id=wf.id,
+        graph=g, created_by=created_by,
+    )
+    await deploy_version(
+        session, org_id=org_id, workflow_id=wf.id,
+        workflow_version_id=ver.id,
+    )
+    return wf
+
+
+__all__ = [
+    "WorkflowError", "WorkflowNotFound", "WorkflowVersionNotFound",
+    "DuplicateWorkflowName", "InvalidWorkflowGraph", "WorkflowNotDeployed",
+    "create_workflow", "create_version", "deploy_version",
+    "get_workflow", "list_workflows", "resolve_runtime_graph",
+    "start_workflow_run", "default_starter_graph", "create_deployed_workflow",
+]
