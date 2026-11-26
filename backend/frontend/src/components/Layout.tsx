@@ -41,7 +41,7 @@ export function Layout() {
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 bg-teal-100 text-teal-700 rounded-lg flex items-center justify-center font-bold">S</div>
               <div>
-                <div className="text-sm font-semibold">Shopnova</div>
+                <div className="text-sm font-semibold">Lerricklabs</div>
                 <div className="text-[11px] text-gray-500">Growth plan</div>
               </div>
             </div>
