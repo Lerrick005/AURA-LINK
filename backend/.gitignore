@@ -1,3 +1,16 @@
 ﻿*.bak_*
 audit_output.txt
 diag_*.py
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Debug artifacts
+_*.py
+_*.log
+token.js
+
+# Backups
+_patch_backup_*/

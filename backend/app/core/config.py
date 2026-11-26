@@ -1,7 +1,7 @@
-﻿"""Centralized runtime configuration for Auralink.
+"""Centralized runtime configuration for Auralink.
 
 All settings are loaded once at import and cached by ``get_settings()``.
-No module should read ``os.environ`` directly â€” everything goes through here
+No module should read ``os.environ`` directly — everything goes through here
 so that validation, secret masking, and env-specific behavior stay consistent.
 
 Design notes (see docs/adr/):
@@ -59,10 +59,10 @@ class Settings(BaseSettings):
 
     # --- Auth / Sessions --------------------------------------------------
     # HS256 secrets must be at least 32 bytes of entropy (we hash a passphrase
-    # upstream if the operator provides something shorter â€” see SECURITY.md).
+    # upstream if the operator provides something shorter — see SECURITY.md).
     JWT_SECRET: SecretStr = Field(..., min_length=32)
     JWT_ALGORITHM: Literal["HS256", "HS384", "HS512"] = "HS256"
-    ACCESS_TOKEN_TTL_SECONDS: int = 15 * 60
+    ACCESS_TOKEN_TTL_SECONDS: int = 60 * 60
     REFRESH_TOKEN_TTL_SECONDS: int = 30 * 24 * 60 * 60
     ARGON2_TIME_COST: int = 3
     ARGON2_MEMORY_COST_KIB: int = 65_536  # 64 MiB

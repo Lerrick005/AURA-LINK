@@ -1,4 +1,4 @@
-﻿"""Auralink FastAPI application.
+"""Auralink FastAPI application.
 
 Wires logging, request-ID middleware, CORS, and the v1 router.
 Call site for uvicorn:
@@ -27,6 +27,7 @@ from app.modules.agents.routes import router as agents_router
 from app.modules.webhooks.routes import router as webhooks_router
 from app.modules.runs.routes import router as runs_router
 from app.modules.workflows.routes import router as workflows_router
+from app.api.v1.assistant import router as assistant_router
 from app.core import logging as alog
 from app.core.config import get_settings
 from app.core.db import dispose_engine
@@ -174,6 +175,7 @@ def create_app() -> FastAPI:
     app.include_router(runs_router, prefix=s.API_V1_PREFIX)
     app.include_router(agents_router, prefix=s.API_V1_PREFIX)
     app.include_router(webhooks_router, prefix=s.API_V1_PREFIX)
+    app.include_router(assistant_router, prefix=s.API_V1_PREFIX)
     return app
 
 

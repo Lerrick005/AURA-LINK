@@ -1,5 +1,5 @@
 /** @type {import("tailwindcss").Config} */
-export default {
+module.exports = {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
@@ -8,14 +8,8 @@ export default {
         accent: { 500: "#3b82f6", 400: "#60a5fa" },
       },
       keyframes: {
-        dash: {
-          "0%": { strokeDashoffset: "24" },
-          "100%": { strokeDashoffset: "0" },
-        },
-        bounce: {
-          "0%, 100%": { transform: "translateY(0)" },
-          "50%": { transform: "translateY(-10px)" },
-        }
+        dash: { "0%": { strokeDashoffset: "24" }, "100%": { strokeDashoffset: "0" } },
+        bounce: { "0%, 100%": { transform: "translateY(0)" }, "50%": { transform: "translateY(-10px)" } }
       },
     },
   },
